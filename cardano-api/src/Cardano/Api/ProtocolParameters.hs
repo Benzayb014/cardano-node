@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
@@ -106,8 +107,8 @@ import           Text.PrettyBy.Default (display)
 import           Cardano.Api.Address
 import           Cardano.Api.Eras
 import           Cardano.Api.Error
-import           Cardano.Api.HasTypeProxy
 import           Cardano.Api.Hash
+import           Cardano.Api.HasTypeProxy
 import           Cardano.Api.KeysByron
 import           Cardano.Api.KeysShelley
 import           Cardano.Api.Script
@@ -119,6 +120,7 @@ import           Cardano.Api.StakePoolMetadata
 import           Cardano.Api.TxMetadata
 import           Cardano.Api.Utils
 import           Cardano.Api.Value
+import           Control.Applicative ((<|>))
 
 
 -- | The values of the set of /updatable/ protocol parameters. At any
@@ -1436,15 +1438,20 @@ toAlonzoPParams ProtocolParameters {
                    protocolParamPoolPledgeInfluence,
                    protocolParamMonetaryExpansion,
                    protocolParamTreasuryCut,
-                   protocolParamUTxOCostPerWord = Just utxoCostPerWord,
+                   protocolParamUTxOCostPerWord,
                    protocolParamCostModels,
                    protocolParamPrices          = Just prices,
                    protocolParamMaxTxExUnits    = Just maxTxExUnits,
                    protocolParamMaxBlockExUnits = Just maxBlockExUnits,
                    protocolParamMaxValueSize    = Just maxValueSize,
                    protocolParamCollateralPercent   = Just collateralPercentage,
-                   protocolParamMaxCollateralInputs = Just maxCollateralInputs
+                   protocolParamMaxCollateralInputs = Just maxCollateralInputs,
+                   protocolParamUTxOCostPerByte
                  } =
+    let !coinsPerUTxOWord = fromMaybe
+          (error "toAlonzoPParams: must specify protocolParamUTxOCostPerWord or protocolParamUTxOCostPerByte") $
+            protocolParamUTxOCostPerWord <|> ((* 8) <$> protocolParamUTxOCostPerByte)
+    in
     Alonzo.PParams {
       Alonzo._protocolVersion
                            = let (maj, minor) = protocolParamProtocolVersion
@@ -1483,7 +1490,7 @@ toAlonzoPParams ProtocolParameters {
                                (Ledger.boundRational protocolParamTreasuryCut)
 
       -- New params in Alonzo:
-    , Alonzo._coinsPerUTxOWord  = toShelleyLovelace utxoCostPerWord
+    , Alonzo._coinsPerUTxOWord  = toShelleyLovelace coinsPerUTxOWord
     , Alonzo._costmdls        = either
                                   (\e -> error $ "toAlonzoPParams: invalid cost models, error: " <> e)
                                   id
