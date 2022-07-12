@@ -140,6 +140,7 @@ library
                       , random
                       , cardano-ledger-shelley
                       , set-algebra
+                      , small-steps
                       , split
                       , strict-containers
                       , text
