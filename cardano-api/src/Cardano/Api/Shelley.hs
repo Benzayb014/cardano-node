@@ -207,9 +207,15 @@ module Cardano.Api.Shelley
     CurrentEpochState(..),
     SerialisedCurrentEpochState(..),
     decodeCurrentEpochState,
+
     PoolState(..),
     SerialisedPoolState(..),
     decodePoolState,
+
+    StakeSnapshot(..),
+    SerialisedStakeSnapshot(..),
+    decodeStakeSnapshot,
+
     UTxO(..),
 
     -- ** Various calculations

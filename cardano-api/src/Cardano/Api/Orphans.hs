@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
@@ -16,7 +17,7 @@ module Cardano.Api.Orphans () where
 
 import           Prelude
 
-import           Data.Aeson (FromJSON (..), ToJSON (..), object, (.=))
+import           Data.Aeson (FromJSON (..), ToJSON (..), object, pairs, (.=))
 import qualified Data.Aeson as Aeson
 import           Data.Aeson.Types (ToJSONKey (..), toJSONKeyText)
 import           Data.BiMap (BiMap (..), Bimap)
@@ -56,12 +57,13 @@ import qualified Cardano.Ledger.Shelley.Constraints as Shelley
 import qualified Cardano.Ledger.Shelley.EpochBoundary as ShelleyEpoch
 import qualified Cardano.Ledger.Shelley.LedgerState as ShelleyLedger
 import           Cardano.Ledger.Shelley.PParams (PParamsUpdate)
-import qualified Cardano.Ledger.Shelley.RewardUpdate as Shelley
 import qualified Cardano.Ledger.Shelley.Rewards as Shelley
+import qualified Cardano.Ledger.Shelley.RewardUpdate as Shelley
 import qualified Ouroboros.Consensus.Shelley.Eras as Consensus
 
 import           Cardano.Api.Script
 import           Cardano.Api.SerialiseRaw (serialiseToRawBytesHexText)
+import qualified Ouroboros.Consensus.Shelley.Ledger.Query as Consensus
 
 -- Orphan instances involved in the JSON output of the API queries.
 -- We will remove/replace these as we provide more API wrapper types
@@ -418,3 +420,40 @@ instance Crypto.Crypto crypto => ToJSON (VMap VB VB (Shelley.KeyHash    'Shelley
 
 instance Crypto.Crypto crypto => ToJSON (VMap VB VP (Shelley.Credential 'Shelley.Staking   crypto) (Shelley.CompactForm Shelley.Coin)) where
   toJSON = toJSON . fmap fromCompact . VMap.toMap
+
+-----
+
+instance ToJSON (Consensus.StakeSnapshot crypto) where
+  toJSON
+    Consensus.StakeSnapshot
+    { Consensus.sMarkPool
+    , Consensus.sSetPool
+    , Consensus.sGoPool
+    , Consensus.sMarkTotal
+    , Consensus.sSetTotal
+    , Consensus.sGoTotal
+    } = object
+    [ "poolStakeMark" .= sMarkPool
+    , "poolStakeSet" .= sSetPool
+    , "poolStakeGo" .= sGoPool
+    , "activeStakeMark" .= sMarkTotal
+    , "activeStakeSet" .= sSetTotal
+    , "activeStakeGo" .= sGoTotal
+    ]
+
+  toEncoding
+    Consensus.StakeSnapshot
+    { Consensus.sMarkPool
+    , Consensus.sSetPool
+    , Consensus.sGoPool
+    , Consensus.sMarkTotal
+    , Consensus.sSetTotal
+    , Consensus.sGoTotal
+    } = pairs $ mconcat
+    [ "poolStakeMark" .= sMarkPool
+    , "poolStakeSet" .= sSetPool
+    , "poolStakeGo" .= sGoPool
+    , "activeStakeMark" .= sMarkTotal
+    , "activeStakeSet" .= sSetTotal
+    , "activeStakeGo" .= sGoTotal
+    ]
