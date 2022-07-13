@@ -97,6 +97,13 @@ runRTView TracerConfig{logging, network, hasRTView}
           lastResources
           chainHistory
           txHistory
+      , runHistoricalBackup
+          connectedNodes
+          chainHistory
+          resourcesHistory
+          txHistory
+          dpRequestors
+          currentDPLock
       , runEraSettingsUpdater
           connectedNodes
           eraSettings

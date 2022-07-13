@@ -5,6 +5,7 @@ module Cardano.Tracer.Handlers.RTView.State.Historical
   , DataName (..)
   , History
   , HistoricalPoint
+  , HistoricalPoints
   , POSIXTime
   , ResourcesHistory (..)
   , TransactionsHistory (..)
@@ -104,7 +105,7 @@ data DataName
   | TxsProcessedNumData
   | MempoolBytesData
   | TxsInMempoolData
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Read, Show)
 
 type HistoricalData = Map DataName HistoricalPoints
 type History        = TVar (Map NodeId HistoricalData)
