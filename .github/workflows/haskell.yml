@@ -97,12 +97,14 @@ jobs:
 
     - name: Add build script path
       run: |
+        # MSYS2 doesn't inherit $GITHUB_PATH, so this workaround is neede
         cat <(echo "export PATH=$PATH:$(pwd)/.github/bin") ~/.bashrc > ~/.bashrc.new
         mv ~/.bashrc.new ~/.bashrc
+
+        # MacOS and Linux use $GITUB_PATH
         echo "$(pwd)/.github/bin" >> $GITHUB_PATH
 
     - name: "WIN: List all pkg-config packages"
-      if: matrix.os == 'windows-latest'
       run: |
         echo "=== Package list ==="
         pkg-config --list-all
@@ -132,6 +134,7 @@ jobs:
         sudo apt-get update
         sudo apt-get -y install libsodium23 libsodium-dev
         sudo apt-get -y install libsystemd0 libsystemd-dev
+        sudo apt-get -y install liblmdb-dev
         sudo apt-get -y remove --purge software-properties-common
         sudo apt-get -y autoremove
 
@@ -153,7 +156,9 @@ jobs:
 
     - name: "MAC: Install build environment (brew)"
       if: matrix.os == 'macos-latest'
-      run: brew install libsodium
+      run: |
+        brew install libsodium
+        brew install lmdb
 
     - name: "MAC: Install build environment (secp256k1)"
       if: matrix.os == 'macos-latest'
