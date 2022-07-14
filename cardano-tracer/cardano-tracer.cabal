@@ -150,6 +150,7 @@ library
                        , trace-dispatcher
                        , trace-forward
                        , unordered-containers
+                       , vector
                        , yaml
 
   if os(linux)

@@ -18,11 +18,8 @@ import           Control.Monad.Extra (ifM, whenJust)
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.Csv as CSV
 import qualified Data.Map.Strict as M
-import           Data.Maybe (mapMaybe)
 import qualified Data.Set as S
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
-import           Data.Text.Read (decimal, double)
 import           Data.Time.Clock.System (getSystemTime, systemToUTCTime)
 import qualified Data.Vector as V
 import           System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
@@ -168,7 +165,7 @@ restoreHistoryFromBackup connectedNodes
           Right rawPoints ->
             case CSV.decode CSV.NoHeader rawPoints of
               Left _ -> return (Nothing, S.empty)
-              Right (points :: Vector HistoricalPoint) -> return
+              Right (points :: V.Vector HistoricalPoint) -> return
                 ( Just dataName
                 , S.fromList $ V.toList points
                 )
