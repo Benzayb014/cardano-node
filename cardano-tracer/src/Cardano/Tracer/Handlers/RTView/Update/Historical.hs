@@ -12,13 +12,16 @@ import           Control.Concurrent.Async (forConcurrently_)
 import           Control.Concurrent.Extra (Lock)
 import           Control.Concurrent.STM (atomically)
 import           Control.Concurrent.STM.TVar (modifyTVar', readTVar, readTVarIO)
-import           Control.Exception.Extra (ignore)
+import           Control.Exception.Extra (ignore, try_)
 import           Control.Monad (forM, forM_, forever)
 import           Control.Monad.Extra (ifM, whenJust)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.Map.Strict as M
+import           Data.Maybe (mapMaybe)
 import qualified Data.Set as S
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
+import           Data.Text.Read (decimal, double)
 import           Data.Time.Clock.System (getSystemTime, systemToUTCTime)
 import           System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
 import           System.Directory.Extra (listFiles)
@@ -143,7 +146,7 @@ restoreHistoryFromBackup connectedNodes
                          (ChainHistory _chainHistory)
                          (ResHistory _resourcesHistory)
                          (TXHistory _txHistory)
-                         dpRequestors currentDPLock = do
+                         dpRequestors currentDPLock = ignore $ do
   -- We restore historical data only for connected nodes.
   connected <- S.toList <$> readTVarIO connectedNodes
   nodesIdsWithNames <- getNodesIdsWithNames connected dpRequestors currentDPLock
@@ -152,12 +155,42 @@ restoreHistoryFromBackup connectedNodes
     let nodeSubdir = backupDir </> T.unpack nodeName
     doesDirectoryExist nodeSubdir >>= \case
       False -> return () -- There is no backup for this node.
-      True ->
-        listFiles nodeSubdir >>= \case
-          [] -> return () -- Backup files were removed.
-          backupFiles -> do
-            let _r = map (\f -> readMaybe (takeBaseName f) :: Maybe DataName) backupFiles
-            return ()
+      True -> do
+        backupFiles <- listFiles nodeSubdir
+        _dataNamesWithPoints <-
+          forM backupFiles $ extractNamesWithHistoricalPoints nodeSubdir
+        
+        return ()
+ where
+   extractNamesWithHistoricalPoints nodeSubdir bFile = do
+    let pureFile = takeBaseName bFile
+    case readMaybe pureFile of
+      Nothing -> return (Nothing, S.empty)
+      Just (dataName :: DataName) ->
+        -- Ok, this file contains historical points for 'dataName', extract them...
+        try_ (TIO.readFile (nodeSubdir </> pureFile)) >>= \case
+          Left _ -> return (Nothing, S.empty)
+          Right rawPoints -> return
+            ( Just dataName
+            , S.fromList . mapMaybe mkPoint $ T.splitOn ";" rawPoints
+            )
+
+   -- For example, "1234544,4124231"
+   mkPoint "" = Nothing
+   mkPoint rawPair =
+     case T.splitOn "," rawPair of
+       [rawTS, rawV] ->
+         case decimal rawTS of
+           Left _ -> Nothing
+           Right (ts :: POSIXTime, _) ->
+             if "." `T.isInfixOf` rawV
+               then case double rawV of
+                      Left _ -> Nothing
+                      Right (v, _) -> Just (ts, ValueD v)
+               else case decimal rawV of
+                      Left _ -> Nothing
+                      Right (v :: Int, _) -> Just (ts, ValueI v)
+       _ -> Nothing
 
 getNodesIdsWithNames
   :: [NodeId]
