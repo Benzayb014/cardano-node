@@ -434,11 +434,11 @@ instance IsCardanoEra era => SerialiseAddress (AddressInEra era) where
       anyAddressInEra cardanoEra =<< deserialiseAddress AsAddressAny t
 
 instance EraCast (AddressTypeInEra addrtype) where
-  eraCast toEra' = \case
+  eraCast toEra' v = case v of
     ByronAddressInAnyEra -> pure ByronAddressInAnyEra
     ShelleyAddressInEra previousEra ->
       case cardanoEraStyle toEra' of
-        LegacyByronEra -> Left $ EraCastError "AddressTypeInEra addrtype" (shelleyBasedToCardanoEra previousEra) toEra'
+        LegacyByronEra -> Left $ EraCastError v (shelleyBasedToCardanoEra previousEra) toEra'
         ShelleyBasedEra newSbe -> Right $ ShelleyAddressInEra newSbe
 
 byronAddressInEra :: Address ByronAddr -> AddressInEra era

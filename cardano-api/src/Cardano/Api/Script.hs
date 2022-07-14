@@ -1422,6 +1422,7 @@ data ReferenceScript era where
 
 deriving instance Eq (ReferenceScript era)
 deriving instance Show (ReferenceScript era)
+deriving instance Typeable (ReferenceScript era)
 
 instance IsCardanoEra era => ToJSON (ReferenceScript era) where
   toJSON (ReferenceScript _ s) = object ["referenceScript" .= s]
@@ -1437,9 +1438,9 @@ instance IsCardanoEra era => FromJSON (ReferenceScript era) where
 instance EraCast ReferenceScript where
   eraCast toEra = \case
     ReferenceScriptNone -> pure ReferenceScriptNone
-    ReferenceScript (_ :: ReferenceTxInsScriptsInlineDatumsSupportedInEra fromEra) scriptInAnyLang ->
+    v@(ReferenceScript (_ :: ReferenceTxInsScriptsInlineDatumsSupportedInEra fromEra) scriptInAnyLang) ->
       case refInsScriptsAndInlineDatsSupportedInEra toEra of
-        Nothing -> Left $ EraCastError "ReferenceScript" (cardanoEra @fromEra) toEra
+        Nothing -> Left $ EraCastError v (cardanoEra @fromEra) toEra
         Just supportedInEra -> Right $ ReferenceScript supportedInEra scriptInAnyLang
 
 data ReferenceTxInsScriptsInlineDatumsSupportedInEra era where

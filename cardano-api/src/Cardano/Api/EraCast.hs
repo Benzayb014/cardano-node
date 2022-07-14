@@ -9,14 +9,15 @@ module Cardano.Api.EraCast
 import           Cardano.Api.Eras (CardanoEra (..), IsCardanoEra)
 import           Data.Either (Either)
 import           Data.Kind (Type)
-import           Data.Text (Text)
+import           Text.Show (Show (..))
 
-data EraCastError = forall fromEra toEra.
+data EraCastError = forall fromEra toEra value.
   ( IsCardanoEra fromEra
   , IsCardanoEra toEra
+  , Show value
   ) =>
     EraCastError
-    { typeName :: Text
+    { value :: value
     , fromEra :: CardanoEra fromEra
     , toEra :: CardanoEra toEra
     }
