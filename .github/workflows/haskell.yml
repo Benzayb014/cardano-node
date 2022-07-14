@@ -153,6 +153,8 @@ jobs:
       run: |
         brew install libsodium
         brew install lmdb
+        # LMDB is distributed without pkg-config file
+        cp $(pwd)/.github/workflows/lmdb.pc /usr/local/lib/pkgconfig/lmdb.pc
 
     - name: "MAC: Install build environment (secp256k1)"
       if: matrix.os == 'macos-latest'
