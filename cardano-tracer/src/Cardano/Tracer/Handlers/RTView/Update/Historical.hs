@@ -135,40 +135,92 @@ restoreHistoryFromBackup
   -> Lock
   -> IO ()
 restoreHistoryFromBackup connectedNodes
-                         (ChainHistory _chainHistory)
-                         (ResHistory _resourcesHistory)
-                         (TXHistory _txHistory)
+                         (ChainHistory chainHistory)
+                         (ResHistory resourcesHistory)
+                         (TXHistory txHistory)
                          dpRequestors currentDPLock = ignore $ do
   -- We restore historical data only for connected nodes.
   connected <- S.toList <$> readTVarIO connectedNodes
   nodesIdsWithNames <- getNodesIdsWithNames connected dpRequestors currentDPLock
   backupDir <- getPathToBackupDir
-  forM_ nodesIdsWithNames $ \(_nodeId, nodeName) -> do
+  forM_ nodesIdsWithNames $ \(nodeId, nodeName) -> do
     let nodeSubdir = backupDir </> T.unpack nodeName
     doesDirectoryExist nodeSubdir >>= \case
       False -> return () -- There is no backup for this node.
       True -> do
         backupFiles <- listFiles nodeSubdir
-        _dataNamesWithPoints <-
-          forM backupFiles $ extractNamesWithHistoricalPoints nodeSubdir
-        
-        return ()
+        namesWithPoints <- forM backupFiles $ extractNamesWithHistoricalPoints nodeSubdir
+        fillHistory nodeId chainHistory     chainData namesWithPoints
+        fillHistory nodeId resourcesHistory resData   namesWithPoints
+        fillHistory nodeId txHistory        txData    namesWithPoints
  where
-   extractNamesWithHistoricalPoints nodeSubdir bFile = do
+  extractNamesWithHistoricalPoints nodeSubdir bFile = do
     let pureFile = takeBaseName bFile
     case readMaybe pureFile of
-      Nothing -> return (Nothing, S.empty)
+      Nothing -> return noPoints
       Just (dataName :: DataName) ->
         -- Ok, this file contains historical points for 'dataName', extract them...
         try_ (BSL.readFile (nodeSubdir </> pureFile)) >>= \case
-          Left _ -> return (Nothing, S.empty)
+          Left _ -> return noPoints
           Right rawPoints ->
             case CSV.decode CSV.NoHeader rawPoints of
-              Left _ -> return (Nothing, S.empty)
-              Right (points :: V.Vector HistoricalPoint) -> return
-                ( Just dataName
-                , S.fromList $ V.toList points
-                )
+              Left _ -> return noPoints -- Maybe file was broken?..
+              Right (points :: V.Vector HistoricalPoint) ->
+                return ( Just dataName
+                       , S.fromList $ V.toList points
+                       )
+
+  noPoints = (Nothing, S.empty)
+
+  fillHistory nodeId history dataNames dataNamesWithPoints = do
+    let newData = mkMapOfData dataNamesWithPoints M.empty
+    atomically . modifyTVar' history $ \currentHistory ->
+      case M.lookup nodeId currentHistory of
+        Nothing -> M.insert nodeId newData currentHistory
+        Just _  -> M.adjust (const newData) nodeId currentHistory
+   where
+    mkMapOfData [] aMap = aMap
+    mkMapOfData ((mDataName, points):others) aMap =
+      case mDataName of
+        Nothing -> mkMapOfData others aMap
+        Just dataName ->
+          if dataName `elem` dataNames
+            then mkMapOfData others $ M.insert dataName points aMap
+            else mkMapOfData others aMap
+
+  chainData =
+    [ ChainDensityData
+    , SlotNumData
+    , BlockNumData
+    , SlotInEpochData
+    , EpochData
+    , NodeCannotForgeData
+    , ForgedSlotLastData
+    , NodeIsLeaderData
+    , NodeIsNotLeaderData
+    , ForgedInvalidSlotLastData
+    , AdoptedSlotLastData
+    , NotAdoptedSlotLastData
+    , AboutToLeadSlotLastData
+    , CouldNotForgeSlotLastData
+    ]
+
+  resData =
+    [ CPUData
+    , MemoryData
+    , GCMajorNumData
+    , GCMinorNumData
+    , GCLiveMemoryData
+    , CPUTimeGCData
+    , CPUTimeAppData
+    , ThreadsNumData
+    ]
+
+  txData =
+    [ TxsProcessedNumData
+    , MempoolBytesData
+    , TxsInMempoolData
+    ]
 
 getNodesIdsWithNames
   :: [NodeId]

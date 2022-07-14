@@ -32,6 +32,7 @@ import           Cardano.Tracer.Handlers.RTView.UI.Theme
 import           Cardano.Tracer.Handlers.RTView.UI.Utils
 import           Cardano.Tracer.Handlers.RTView.Update.EKG
 import           Cardano.Tracer.Handlers.RTView.Update.Errors
+import           Cardano.Tracer.Handlers.RTView.Update.Historical
 import           Cardano.Tracer.Handlers.RTView.Update.KES
 import           Cardano.Tracer.Handlers.RTView.Update.Nodes
 import           Cardano.Tracer.Handlers.RTView.Update.NodeState
@@ -105,6 +106,13 @@ mkMainPage connectedNodes displayedElements acceptedMetrics savedTO
   restoreChartsSettings
   restoreEmailSettings window
   restoreEventsSettings window
+  liftIO $ restoreHistoryFromBackup
+    connectedNodes
+    chainHistory
+    resourcesHistory
+    txHistory
+    dpRequestors
+    currentDPLock
 
   uiNoNodesProgressTimer <- UI.timer # set UI.interval 1000
   on UI.tick uiNoNodesProgressTimer . const $ do
@@ -123,6 +131,7 @@ mkMainPage connectedNodes displayedElements acceptedMetrics savedTO
 
   whenM (liftIO $ readTVarIO reloadFlag) $ do
     liftIO $ cleanupDisplayedValues displayedElements
+
     updateUIAfterReload
       window
       connectedNodes
@@ -135,7 +144,17 @@ mkMainPage connectedNodes displayedElements acceptedMetrics savedTO
       nodesErrors
       uiErrorsTimer
       uiNoNodesProgressTimer
-    liftIO $ pageWasNotReload reloadFlag
+
+    liftIO $ do
+      restoreHistoryFromBackup
+        connectedNodes
+        chainHistory
+        resourcesHistory
+        txHistory
+        dpRequestors
+        currentDPLock
+
+      pageWasNotReload reloadFlag
 
   -- Uptime is a real-time clock, so update it every second.
   uiUptimeTimer <- UI.timer # set UI.interval 1000
