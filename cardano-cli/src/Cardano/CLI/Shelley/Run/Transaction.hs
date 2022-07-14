@@ -45,7 +45,7 @@ import qualified Cardano.Binary as CBOR
 import           Cardano.Ledger.Shelley.Scripts ()
 import           Cardano.Ledger.ShelleyMA.TxBody ()
 
-import           Cardano.Api.EraCast (EraCast (..), EraCastError (..))
+import           Cardano.Api.EraCast
 import           Cardano.CLI.Environment (EnvSocketError, readEnvSocketPath, renderEnvSocketError)
 import           Cardano.CLI.Run.Friendly (friendlyTxBS, friendlyTxBodyBS)
 import           Cardano.CLI.Shelley.Key (InputDecodeError, readSigningKeyFileAnyOf)

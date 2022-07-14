@@ -154,7 +154,7 @@ import qualified Cardano.Ledger.Alonzo.Scripts as Alonzo
 
 import qualified Plutus.V1.Ledger.Examples as Plutus
 
-import           Cardano.Api.EraCast (EraCast (eraCast), EraCastError (..))
+import           Cardano.Api.EraCast
 import           Cardano.Api.Eras
 import           Cardano.Api.Error
 import           Cardano.Api.Hash

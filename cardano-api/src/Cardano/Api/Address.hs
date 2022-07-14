@@ -97,7 +97,7 @@ import qualified Cardano.Ledger.Credential as Shelley
 import           Cardano.Ledger.Crypto (StandardCrypto)
 import qualified Plutus.V1.Ledger.Api as Plutus
 
-import           Cardano.Api.EraCast (EraCast (..), EraCastError (..))
+import           Cardano.Api.EraCast
 import           Cardano.Api.Eras
 import           Cardano.Api.Hash
 import           Cardano.Api.HasTypeProxy

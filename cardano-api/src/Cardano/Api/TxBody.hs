@@ -189,7 +189,6 @@ import qualified Text.Parsec as Parsec
 import           Text.Parsec ((<?>))
 import qualified Text.Parsec.String as Parsec
 
-import           Cardano.Api.EraCast (EraCast (..), EraCastError (EraCastError))
 import           Cardano.Binary (Annotated (..), reAnnotate, recoverBytes)
 import qualified Cardano.Binary as CBOR
 import qualified Cardano.Crypto.Hash.Class as Crypto
@@ -244,6 +243,7 @@ import           Ouroboros.Consensus.Shelley.Eras (StandardAllegra, StandardAlon
 
 import           Cardano.Api.Address
 import           Cardano.Api.Certificate
+import           Cardano.Api.EraCast
 import           Cardano.Api.Eras
 import           Cardano.Api.Error
 import           Cardano.Api.Hash
