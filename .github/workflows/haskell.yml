@@ -99,12 +99,14 @@ jobs:
 
     - name: Add build script path
       run: |
-        # MSYS2 doesn't inherit $GITHUB_PATH, so this workaround is neede
-        cat <(echo "export PATH=$PATH:$(pwd)/.github/bin") ~/.bashrc > ~/.bashrc.new
-        mv ~/.bashrc.new ~/.bashrc
-
-        # MacOS and Linux use $GITUB_PATH
-        echo "$(pwd)/.github/bin" >> $GITHUB_PATH
+        if [ "${{ matrix.os }}" == "windows-latest" ]; then
+          # MSYS2 doesn't inherit $GITHUB_PATH, so this workaround is needed
+          cat <(echo "export PATH=$PATH:$(pwd)/.github/bin") ~/.bashrc > ~/.bashrc.new
+          mv ~/.bashrc.new ~/.bashrc
+        else
+          # MacOS and Linux use $GITUB_PATH
+          echo "$(pwd)/.github/bin" >> $GITHUB_PATH
+        fi
 
     - name: "WIN: Install build environment (secp256k1)"
       if: matrix.os == 'windows-latest'
@@ -173,11 +175,16 @@ jobs:
         echo "=== Package list ==="
         pkg-config --list-all
 
-        echo "=== Package details ==="
-        for x in $(pkg-config --list-all | cut -d ' ' -f 1); do
-          echo "# $x"
-          pkg-config "$x" --cflags --libs
-        done
+        if [ "${{ matrix.os }}" == "macos-latest" ]; then
+          echo "=== Not printing every package detail in MacOS"
+          # due to the location of the installed libraries this fails on MacOS with stuff not related to us
+        else
+          echo "=== Package details ==="
+          for x in $(pkg-config --list-all | cut -d ' ' -f 1); do
+            echo "# $x"
+            pkg-config "$x" --cflags --libs
+          done
+        fi
 
     - name: Cabal update
       run: retry 2 cabal update
@@ -189,7 +196,7 @@ jobs:
           sed -i 's|tests: False|tests: True|g' cabal.project
         fi
 
-        cp .github/workflows/cabal.project.local.$RUNNER_OS cabal.project.local
+        cp .github/workflows/cabal.project.local.ci cabal.project.local
 
         echo "# cabal.project.local"
         cat cabal.project.local

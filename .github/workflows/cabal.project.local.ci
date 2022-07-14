@@ -1,8 +1,8 @@
 package cardano-crypto-praos
   flags: -external-libsodium-vrf
 
-package HsOpenSSL
+package lmdb
   flags: +use-pkg-config
 
-package lmdb
+package HsOpenSSL
   flags: +use-pkg-config
