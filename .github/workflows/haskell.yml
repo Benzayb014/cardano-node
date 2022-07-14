@@ -104,17 +104,6 @@ jobs:
         # MacOS and Linux use $GITUB_PATH
         echo "$(pwd)/.github/bin" >> $GITHUB_PATH
 
-    - name: "WIN: List all pkg-config packages"
-      run: |
-        echo "=== Package list ==="
-        pkg-config --list-all
-
-        echo "=== Package details ==="
-        for x in $(pkg-config --list-all | cut -d ' ' -f 1); do
-          echo "# $x"
-          pkg-config "$x" --cflags --libs
-        done
-
     - name: "WIN: Install build environment (secp256k1)"
       if: matrix.os == 'windows-latest'
       run: |
@@ -124,6 +113,7 @@ jobs:
           ./autogen.sh
           ./configure --enable-module-schnorrsig --enable-experimental
           make
+          make check
           make install
         )
         rm -rf secp256k1
@@ -145,20 +135,21 @@ jobs:
         mkdir secp256k1-sources
         cd secp256k1-sources
         git clone https://github.com/bitcoin-core/secp256k1.git
-        cd secp256k1
-        git reset --hard $SECP256K1_REF
-        ./autogen.sh
-        ./configure --prefix=/usr --enable-module-schnorrsig --enable-experimental
-        make
-        make check
-        sudo make install
-        cd ../..
+        ( cd secp256k1
+          git reset --hard $SECP256K1_REF
+          ./autogen.sh
+          ./configure --prefix=/usr --enable-module-schnorrsig --enable-experimental
+          make
+          make check
+          sudo make install
+        )
 
     - name: "MAC: Install build environment (brew)"
       if: matrix.os == 'macos-latest'
       run: |
         brew install libsodium
         brew install lmdb
+        brew install openssl
 
     - name: "MAC: Install build environment (secp256k1)"
       if: matrix.os == 'macos-latest'
@@ -167,13 +158,25 @@ jobs:
         mkdir secp256k1-sources
         cd secp256k1-sources
         git clone https://github.com/bitcoin-core/secp256k1.git
-        cd secp256k1
-        git reset --hard $SECP256K1_REF
-        ./autogen.sh
-        ./configure --enable-module-schnorrsig --enable-experimental
-        make
-        make check
-        make install
+        ( cd secp256k1
+          git reset --hard $SECP256K1_REF
+          ./autogen.sh
+          ./configure --enable-module-schnorrsig --enable-experimental
+          make
+          make check
+          make install
+        )
+
+    - name: "List all pkg-config packages"
+      run: |
+        echo "=== Package list ==="
+        pkg-config --list-all
+
+        echo "=== Package details ==="
+        for x in $(pkg-config --list-all | cut -d ' ' -f 1); do
+          echo "# $x"
+          pkg-config "$x" --cflags --libs
+        done
 
     - name: Cabal update
       run: retry 2 cabal update
