@@ -202,7 +202,7 @@ jobs:
     - name: Cache Cabal store
       uses: actions/cache@v2
       with:
-        path: ${{ steps.setup-haskell.outputs.cabal-store }}
+        path: ${{ matrix.os == 'windows-latest' && '/c/cabal/store' || steps.setup-haskell.outputs.cabal-store }}
         key: cache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('dependencies.txt') }}-${{ hashFiles('date.txt') }}
         restore-keys: |
           cache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ matrix.ghc }}-${{ hashFiles('dependencies.txt') }}-${{ hashFiles('date.txt') }}
