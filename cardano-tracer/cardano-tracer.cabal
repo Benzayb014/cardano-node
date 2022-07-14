@@ -123,6 +123,7 @@ library
                        , bytestring
                        , cardano-git-rev
                        , cardano-node
+                       , cassava
                        , cborg
                        , containers
                        , contra-tracer

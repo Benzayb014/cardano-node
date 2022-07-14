@@ -15,7 +15,8 @@ import           Control.Concurrent.STM.TVar (modifyTVar', readTVar, readTVarIO)
 import           Control.Exception.Extra (ignore, try_)
 import           Control.Monad (forM, forM_, forever)
 import           Control.Monad.Extra (ifM, whenJust)
-import qualified Data.ByteString.Char8 as BSC
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.Csv as CSV
 import qualified Data.Map.Strict as M
 import           Data.Maybe (mapMaybe)
 import qualified Data.Set as S
@@ -23,6 +24,7 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import           Data.Text.Read (decimal, double)
 import           Data.Time.Clock.System (getSystemTime, systemToUTCTime)
+import qualified Data.Vector as V
 import           System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist)
 import           System.Directory.Extra (listFiles)
 import           System.FilePath ((</>), takeBaseName)
@@ -66,7 +68,6 @@ runHistoricalUpdater
 runHistoricalUpdater _savedTO acceptedMetrics resourcesHistory
                      lastResources chainHistory txHistory = forever $ do
   sleep 1.0 -- TODO: should it be configured?
-
   now <- systemToUTCTime <$> getSystemTime
   allMetrics <- readTVarIO acceptedMetrics
   forM_ (M.toList allMetrics) $ \(nodeId, (ekgStore, _)) -> do
@@ -119,16 +120,10 @@ runHistoricalBackup connectedNodes
       forM_ (M.toList historyData) $ \(historyDataName, historyPoints) -> do
         let historyDataFile = nodeSubdir </> show historyDataName
         ifM (doesFileExist historyDataFile)
-          (BSC.appendFile historyDataFile $ preparePoints historyPoints)
-          (BSC.writeFile  historyDataFile $ preparePoints historyPoints)
+          (BSL.appendFile historyDataFile $ pointsToBS historyPoints)
+          (BSL.writeFile  historyDataFile $ pointsToBS historyPoints)
 
-  preparePoints points = BSC.concat
-    [ showB ts <> "," <> showB v <> ";"
-    | (ts :: POSIXTime, v :: ValueH) <- S.toAscList points
-    ]
-
-  showB :: Show a => a -> BSC.ByteString
-  showB = BSC.pack . show
+  pointsToBS = CSV.encode . S.toAscList
 
   -- Remove sets of historical points only, because they are already backed up.
   cleanupHistoryPoints history = atomically $
@@ -168,29 +163,15 @@ restoreHistoryFromBackup connectedNodes
       Nothing -> return (Nothing, S.empty)
       Just (dataName :: DataName) ->
         -- Ok, this file contains historical points for 'dataName', extract them...
-        try_ (TIO.readFile (nodeSubdir </> pureFile)) >>= \case
+        try_ (BSL.readFile (nodeSubdir </> pureFile)) >>= \case
           Left _ -> return (Nothing, S.empty)
-          Right rawPoints -> return
-            ( Just dataName
-            , S.fromList . mapMaybe mkPoint $ T.splitOn ";" rawPoints
-            )
-
-   -- For example, "1234544,4124231"
-   mkPoint "" = Nothing
-   mkPoint rawPair =
-     case T.splitOn "," rawPair of
-       [rawTS, rawV] ->
-         case decimal rawTS of
-           Left _ -> Nothing
-           Right (ts :: POSIXTime, _) ->
-             if "." `T.isInfixOf` rawV
-               then case double rawV of
-                      Left _ -> Nothing
-                      Right (v, _) -> Just (ts, ValueD v)
-               else case decimal rawV of
-                      Left _ -> Nothing
-                      Right (v :: Int, _) -> Just (ts, ValueI v)
-       _ -> Nothing
+          Right rawPoints ->
+            case CSV.decode CSV.NoHeader rawPoints of
+              Left _ -> return (Nothing, S.empty)
+              Right (points :: Vector HistoricalPoint) -> return
+                ( Just dataName
+                , S.fromList $ V.toList points
+                )
 
 getNodesIdsWithNames
   :: [NodeId]
