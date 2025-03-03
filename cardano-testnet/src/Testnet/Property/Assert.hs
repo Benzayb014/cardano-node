@@ -83,14 +83,12 @@ assertByDeadlineIOCustom str deadline f = withFrozenCallStack $ do
 assertExpectedSposInLedgerState
   :: (MonadTest m, MonadCatch m, MonadIO m, HasCallStack)
   => FilePath -- ^ Stake pools query output filepath
-  -> CardanoTestnetOptions
+  -> NumPools
   -> ExecConfig
   -> m ()
-assertExpectedSposInLedgerState output tNetOptions execConfig = withFrozenCallStack $ do
-  let numExpectedPools = length $ cardanoNodes tNetOptions
-
+assertExpectedSposInLedgerState output (NumPools numExpectedPools) execConfig = withFrozenCallStack $ do
   void $ execCli' execConfig
-      [ "query", "stake-pools"
+      [ "latest", "query", "stake-pools"
       , "--out-file", output
       ]
 
@@ -119,7 +117,7 @@ assertChainExtended deadline nodeLoggingFormat nodeStdoutFile = withFrozenCallSt
     case nodeLoggingFormat of
       NodeLoggingFormatAsText -> IO.fileContains "Chain extended, new tip" nodeStdoutFile
       NodeLoggingFormatAsJson -> fileJsonGrep nodeStdoutFile $ \v ->
-                                    Aeson.parseMaybe (Aeson.parseJSON @(LogEntry Kind)) v == Just (LogEntry (Kind "TraceAddBlockEvent.AddedToCurrentChain"))
+                                    Aeson.parseMaybe (Aeson.parseJSON @(LogEntry Kind)) v == Just (LogEntry (Kind "AddedToCurrentChain"))
 
 newtype LogEntry a = LogEntry
   { unLogEntry :: a
@@ -177,9 +175,12 @@ getRelevantSlots poolNodeStdoutFile slotLowerBound = do
 
 assertErasEqual
   :: HasCallStack
+  => TestEquality eon
+  => Show (eon expectedEra)
+  => Show (eon receivedEra)
   => MonadError String m
-  => ShelleyBasedEra expectedEra
-  -> ShelleyBasedEra receivedEra
+  => eon expectedEra
+  -> eon receivedEra
   -> m (expectedEra :~: receivedEra)
 assertErasEqual expectedEra receivedEra = withFrozenCallStack $
   case testEquality expectedEra receivedEra of

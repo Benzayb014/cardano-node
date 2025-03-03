@@ -1,5 +1,4 @@
 { pkgs
-, runJq
 , jsonFilePretty
 
 , backend
@@ -25,9 +24,12 @@ let
           networkMagic = profile.genesis.network_magic;
           dsmPassthrough = {
             # rtsOpts = ["-xc"];
+          } // optionalAttrs (profile.tracer.withresources or false) {
+            rtsOpts = [ "-scardano-tracer.gcstats" ];
           };
           configFile     = "config.json";
           logRoot        = ".";
+          metricsHelp    = "../../../cardano-tracer/configuration/metrics_help.json";
         } // optionalAttrs backend.useCabalRun {
           executable     = "cardano-tracer";
         } // optionalAttrs profile.tracer.rtview {

@@ -4,11 +4,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Testnet.Ping
   ( pingNode
   , checkSprocket
   , waitForSprocket
+  , waitForPortClosed
   , TestnetMagic
   , PingClientError(..)
   ) where
@@ -20,25 +22,28 @@ import           Cardano.Network.Ping (HandshakeFailure, NodeVersion (..), hands
 
 import qualified Codec.CBOR.Read as CBOR
 import           Control.Exception.Safe
-import           Control.Monad (when)
+import           Control.Monad
 import           Control.Monad.Class.MonadTime.SI (Time)
 import qualified Control.Monad.Class.MonadTimer.SI as MT
 import           Control.Monad.IO.Class
+import qualified Control.Retry as R
 import           Control.Tracer (nullTracer)
 import qualified Data.ByteString.Lazy as LBS
-import           Data.Either (isLeft)
+import           Data.Either
 import           Data.IORef
 import qualified Data.List as L
 import           Data.Word (Word32)
+import qualified Network.Mux as Mux
 import           Network.Mux.Bearer (MakeBearer (..), makeSocketBearer)
 import           Network.Mux.Timeout (TimeoutFn, withTimeoutSerial)
 import           Network.Mux.Types (MiniProtocolDir (InitiatorDir), MiniProtocolNum (..),
-                   MuxBearer (read, write), MuxSDU (..), MuxSDUHeader (..),
-                   RemoteClockModel (RemoteClockModel))
-import           Network.Socket (AddrInfo (..), StructLinger (..))
+                   RemoteClockModel (RemoteClockModel), SDU (..), SDUHeader (..))
+import qualified Network.Mux.Types as Mux
+import           Network.Socket (AddrInfo (..), PortNumber, StructLinger (..))
 import qualified Network.Socket as Socket
 import           Prettyprinter
 
+import qualified Hedgehog.Extras.Stock.IO.Network.Socket as IO
 import qualified Hedgehog.Extras.Stock.IO.Network.Sprocket as IO
 
 type TestnetMagic = Word32
@@ -63,7 +68,7 @@ pingNode :: MonadIO m
 pingNode networkMagic sprocket = liftIO $ bracket
   (Socket.socket (Socket.addrFamily peer) Socket.Stream Socket.defaultProtocol)
   Socket.close
-  (\sd -> withTimeoutSerial $ \timeoutfn -> do
+  (\sd -> handle (pure . Left . PceException) $ withTimeoutSerial $ \timeoutfn -> do
     when (Socket.addrFamily peer /= Socket.AF_UNIX) $ do
       Socket.setSocketOption sd Socket.NoDelay 1
       Socket.setSockOpt sd Socket.Linger
@@ -78,7 +83,7 @@ pingNode networkMagic sprocket = liftIO $ bracket
     bearer <- getBearer makeSocketBearer sduTimeout nullTracer sd
 
     let versions = supportedNodeToClientVersions networkMagic
-    !_ <- write bearer timeoutfn $ wrap handshakeNum InitiatorDir (handshakeReq versions doHandshakeQuery)
+    !_ <- Mux.write bearer timeoutfn $ wrap handshakeNum InitiatorDir (handshakeReq versions doHandshakeQuery)
     (msg, !_) <- nextMsg bearer timeoutfn handshakeNum
 
     pure $ case CBOR.deserialiseFromBytes handshakeDec msg of
@@ -92,9 +97,9 @@ pingNode networkMagic sprocket = liftIO $ bracket
     peer = sprocketToAddrInfo sprocket :: AddrInfo
 
     -- | Wrap a message in a mux service data unit.
-    wrap :: MiniProtocolNum -> MiniProtocolDir -> LBS.ByteString -> MuxSDU
-    wrap mhNum mhDir msBlob = MuxSDU
-      { msHeader = MuxSDUHeader
+    wrap :: MiniProtocolNum -> MiniProtocolDir -> LBS.ByteString -> SDU
+    wrap mhNum mhDir msBlob = SDU
+      { msHeader = SDUHeader
         { mhTimestamp = RemoteClockModel 0
         , mhNum
         , mhDir
@@ -120,12 +125,12 @@ pingNode networkMagic sprocket = liftIO $ bracket
           pure $ host <> ":" <> port
 
     -- | Fetch next message from mux bearer. Ignores messages not matching handshake protocol number.
-    nextMsg :: MuxBearer IO -- ^ a mux bearer
+    nextMsg :: Mux.Bearer IO -- ^ a mux bearer
             -> TimeoutFn IO -- ^ timeout function, for reading messages
             -> MiniProtocolNum -- ^ handshake protocol number
             -> IO (LBS.ByteString, Time) -- ^ raw message and timestamp
     nextMsg bearer timeoutfn ptclNum = do
-      (sdu, t_e) <- Network.Mux.Types.read bearer timeoutfn
+      (sdu, t_e) <- Mux.read bearer timeoutfn
       if mhNum (msHeader sdu) == ptclNum
         then pure (msBlob sdu, t_e)
         else nextMsg bearer timeoutfn ptclNum
@@ -167,6 +172,17 @@ sprocketToAddrInfo sprocket = do
     [] Socket.AF_UNIX Socket.Stream
     Socket.defaultProtocol (Socket.SockAddrUnix socketAbsPath) Nothing
 
+-- | Wait until port gets closed.
+waitForPortClosed
+  :: MonadIO m
+  => MT.DiffTime -- ^ timeout
+  -> MT.DiffTime -- ^ check interval
+  -> PortNumber
+  -> m Bool -- ^ 'True' if port is closed, 'False' if timeout was reached before that
+waitForPortClosed timeout interval portNumber = liftIO $ do
+  let retryPolicy = R.constantDelay (round @Double $ realToFrac interval) <> R.limitRetries (ceiling $ toRational timeout / toRational interval)
+  fmap not . R.retrying retryPolicy (const pure) $ \_ ->
+    liftIO (IO.isPortOpen (fromIntegral portNumber))
 
 data PingClientError
   = PceDecodingError
@@ -179,6 +195,8 @@ data PingClientError
       !String -- ^ peer string
       ![NodeVersion] -- ^ requested versions
       ![NodeVersion] -- ^ received node versions
+  | PceException
+      !SomeException
 
 instance Error PingClientError where
   prettyError = \case
@@ -188,5 +206,6 @@ instance Error PingClientError where
       [ pretty peerStr <+> "Version negotiation error: No overlapping versions with" <+> viaShow requestedVersions
       , "Received versions:" <+> viaShow receivedVersions
       ]
+    PceException exception -> "An unknown exception occurred:" <+> pretty (displayException exception)
 
 

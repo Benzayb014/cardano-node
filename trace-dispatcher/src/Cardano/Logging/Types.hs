@@ -188,6 +188,15 @@ data Metric
   -- | A counter metric.
   -- Text is used to name the metric
     | CounterM Text (Maybe Int)
+  -- | A prometheus metric with key label pairs.
+  -- Text is used to name the metric
+  -- [(Text, Text)] is used to represent the key label pairs
+  -- The value of the metric will always be "1"
+  -- e.g. if you have a prometheus metric with the name "prometheus_metric"
+  -- and the key label pairs [("key1", "value1"), ("key2", "value2")]
+  -- the metric will be represented as "prometheus_metric{key1=\"value1\",key2=\"value2\"} 1"
+
+    | PrometheusM Text [(Text, Text)]
   deriving (Show, Eq)
 
 
@@ -195,6 +204,8 @@ getMetricName :: Metric -> Text
 getMetricName (IntM name _) = name
 getMetricName (DoubleM name _) = name
 getMetricName (CounterM name _) = name
+getMetricName (PrometheusM name _) = name
+
 
 -- | A helper function for creating an empty |Object|.
 emptyObject :: HM.HashMap Text a
@@ -434,20 +445,35 @@ data TraceOptionForwarder = TraceOptionForwarder {
   , tofVerbosity        :: Verbosity
 } deriving (Eq, Generic, Ord, Show, AE.ToJSON)
 
+-- A word regarding queue sizes:
+-- In case of a missing forwarding service consumer, traces messages will be
+-- buffered. This mitigates short forwarding interruptions, or delays at startup time.
+--
+-- The queue capacity should thus correlate to the expected log lines per second given
+-- a particular tracing configuration - to avoid unnecessarily increasing memory footprint.
+--
+-- The default values here are chosen to accomodate verbose tracing output
+-- (i.e., buffering 1min worth of trace data given ~32 messages per second). A config
+-- that results in less than 5 msgs per second should also provide TraceOptionForwarder
+-- queue size values considerably lower. The `disconnQueueSize` is the hard limit in that case.
+--
+-- The queue sizes tie in with the max number of trace objects cardano-tracer requests periodically,
+-- the default for that being 100. Here, the basic queue can hold enough traces for 10 subsequent polls
+-- by cardano-tracer.
 instance AE.FromJSON TraceOptionForwarder where
     parseJSON (AE.Object obj) =
       TraceOptionForwarder
-        <$> obj AE..:? "connQueueSize"    AE..!= 2000
-        <*> obj AE..:? "disconnQueueSize" AE..!= 200000
+        <$> obj AE..:? "connQueueSize"    AE..!= 1024
+        <*> obj AE..:? "disconnQueueSize" AE..!= 2048
         <*> obj AE..:? "verbosity"        AE..!= Minimum
     parseJSON _ = mempty
 
 
 defaultForwarder :: TraceOptionForwarder
 defaultForwarder = TraceOptionForwarder {
-    tofConnQueueSize = 2000
-  , tofDisconnQueueSize = 200000
-  , tofVerbosity = Minimum
+    tofConnQueueSize    = 1024
+  , tofDisconnQueueSize = 2048
+  , tofVerbosity        = Minimum
 }
 
 instance AE.FromJSON ForwarderMode where
@@ -463,6 +489,8 @@ data TraceConfig = TraceConfig {
   , tcForwarder :: Maybe TraceOptionForwarder
     -- | Optional human-readable name of the node.
   , tcNodeName  :: Maybe Text
+    -- | Optional prefix for metrics.
+  , tcMetricsPrefix :: Maybe Text
     -- | Optional peer trace frequency in milliseconds.
   , tcPeerFrequency  :: Maybe Int
     -- | Optional resource trace frequency in milliseconds.
@@ -476,6 +504,7 @@ emptyTraceConfig = TraceConfig {
     tcOptions = Map.empty
   , tcForwarder = Nothing
   , tcNodeName = Nothing
+  , tcMetricsPrefix = Nothing
   , tcPeerFrequency = Just 2000 -- Every 2 seconds
   , tcResourceFrequency = Just 5000 -- Every five seconds
   }

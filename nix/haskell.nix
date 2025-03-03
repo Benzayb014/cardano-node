@@ -4,6 +4,7 @@
 { haskell-nix
 , incl
 , CHaP
+, macOS-security
 }:
 let
 
@@ -22,7 +23,7 @@ let
       name = "cardano-node";
       compiler-nix-name = lib.mkDefault "ghc8107";
       # extra-compilers
-      flake.variants = lib.genAttrs ["ghc964"] (x: {compiler-nix-name = x;});
+      flake.variants = lib.genAttrs ["ghc96"] (x: {compiler-nix-name = x;});
       cabalProjectLocal = ''
         repository cardano-haskell-packages-local
           url: file:${CHaP}
@@ -48,6 +49,9 @@ let
           ghcid
           haskell-language-server
           cabal
+          actionlint
+          shellcheck
+          stylish-haskell
         ];
 
         withHoogle = true;
@@ -113,13 +117,19 @@ let
             packages.plutus-tx-plugin.components.library.platforms = with lib.platforms; [ linux darwin ];
             packages.tx-generator.package.buildable = with pkgs.stdenv.hostPlatform; !isMusl;
 
+            packages.fs-api.components.library.doHaddock = false;
             packages.cardano-ledger-allegra.components.library.doHaddock = false;
             packages.cardano-ledger-alonzo.components.library.doHaddock = false;
             packages.cardano-ledger-api.components.library.doHaddock = false;
             packages.cardano-ledger-babbage.components.library.doHaddock = false;
+            packages.cardano-ledger-core.components.library.doHaddock = false;
             packages.cardano-ledger-conway.components.library.doHaddock = false;
             packages.cardano-ledger-shelley.components.library.doHaddock = false;
             packages.cardano-protocol-tpraos.components.library.doHaddock = false;
+            packages.ouroboros-consensus-cardano.components.library.doHaddock = false;
+            packages.ouroboros-consensus.components.library.doHaddock = false;
+            packages.ouroboros-network.components.library.doHaddock = false; # Currently broken
+            packages.plutus-ledger-api.components.library.doHaddock = false;
           })
           ({ lib, pkgs, ...}: lib.mkIf (pkgs.stdenv.hostPlatform.isWindows) {
             # Remvoe this once mingwx is mapped to null in haskell.nix (haskell.nix#2032), and we bumped _past_ that.
@@ -173,6 +183,7 @@ let
             packages.cardano-node.components.exes.cardano-node.postInstall = postInstall "cardano-node";
             packages.cardano-cli.components.exes.cardano-cli.postInstall = postInstall "cardano-cli";
             packages.cardano-submit-api.components.exes.cardano-submit-api.postInstall = postInstall "cardano-submit-api";
+            packages.cardano-profile.components.exes.cardano-profile.postInstall = postInstall "cardano-profile";
             packages.cardano-topology.components.exes.cardano-topology.postInstall = postInstall "cardano-topology";
             packages.locli.components.exes.locli.postInstall = postInstall "locli";
           })
@@ -185,6 +196,7 @@ let
               mainnetConfigFiles = [
                 "configuration/cardano/mainnet-config.yaml"
                 "configuration/cardano/mainnet-config.json"
+                "configuration/cardano/mainnet-config-new-tracing.json"
                 "configuration/cardano/mainnet-byron-genesis.json"
                 "configuration/cardano/mainnet-shelley-genesis.json"
                 "configuration/cardano/mainnet-alonzo-genesis.json"
@@ -201,6 +213,7 @@ let
                 "cardano-testnet/test/cardano-testnet-golden/files/golden/shelley_node_default_config.json"
                 "cardano-testnet/test/cardano-testnet-golden/files/golden/shelley_node_default_config.json"
                 "cardano-testnet/test/cardano-testnet-test/files/golden/tx.failed.response.json.golden"
+                "cardano-testnet/test/cardano-testnet-test/files/input/sample-constitution.txt"
                 "cardano-testnet/files/data/alonzo/genesis.alonzo.spec.json"
                 "cardano-testnet/files/data/conway/genesis.conway.spec.json"
               ];
@@ -221,11 +234,16 @@ let
                   # This define files included in the directory that will be passed to `H.getProjectBase` for this test:
                   filteredProjectBase = incl ../. cardanoTestnetGoldenFiles;
                 in
+                # work around 104 chars socket path limit by using a different temporary directory
                 ''
                   ${exportCliPath}
                   ${exportNodePath}
                   ${exportChairmanPath}
                   export CARDANO_NODE_SRC=${filteredProjectBase}
+                  # unset TMPDIR, otherwise mktemp will use that as a base
+                  unset TMPDIR
+                  export TMPDIR=$(mktemp -d)
+                  export TMP=$TMPDIR
                 '';
               # cardano-testnet depends on cardano-node, cardano-cli, cardano-submit-api and some config files
               packages.cardano-node.components.tests.cardano-node-test.preCheck =
@@ -252,20 +270,24 @@ let
                   ${exportSubmitApiPath}
                   export CARDANO_NODE_SRC=${filteredProjectBase}
                 ''
-                # the cardano-testnet-tests, use sockets stored in a temporary directory
+                # the cardano-testnet-tests and chairman-tests, use sockets stored in a temporary directory
                 # however on macOS the socket path's max is 104 chars. The package name
                 # is already long, and as such the constructed socket path
                 #
                 #   /private/tmp/nix-build-cardano-testnet-test-cardano-testnet-tests-1.36.0-check.drv-1/chairman-test-93c5d9288dd8e6bc/socket/node-bft1
                 #
-                # exceeds taht limit easily. We therefore set a different tmp directory
+                # exceeds that limit easily. We therefore set a different tmp directory
                 # during the preBuild phase.
                 + ''
                   # unset TMPDIR, otherwise mktemp will use that as a base
                   unset TMPDIR
                   export TMPDIR=$(mktemp -d)
                   export TMP=$TMPDIR
-                '';
+                '' + (if pkgs.stdenv.hostPlatform.isDarwin
+                     then ''
+                  export PATH=${macOS-security}/bin:$PATH
+                          ''
+                     else '''');
               packages.cardano-testnet.components.tests.cardano-testnet-golden.preCheck =
                 let
                   # This define files included in the directory that will be passed to `H.getProjectBase` for this test:

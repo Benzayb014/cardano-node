@@ -1,12 +1,12 @@
 cabal-version: 3.0
 
 name:                   cardano-node
-version:                8.10.1
+version:                10.2.1
 synopsis:               The cardano full node
 description:            The cardano full node.
 category:               Cardano,
                         Validator,
-copyright:              2019-2023 Input Output Global Inc (IOG), 2023-2024 Intersect.
+copyright:              2019-2023 Input Output Global Inc (IOG), 2023-2025 Intersect.
 author:                 IOHK
 maintainer:             operations@iohk.io
 license:                Apache-2.0
@@ -113,6 +113,7 @@ library
                         Cardano.Node.Tracing.Tracers.KESInfo
                         Cardano.Node.Tracing.Tracers.NodeToClient
                         Cardano.Node.Tracing.Tracers.NodeToNode
+                        Cardano.Node.Tracing.Tracers.NodeVersion
                         Cardano.Node.Tracing.Tracers.NonP2P
                         Cardano.Node.Tracing.Tracers.P2P
                         Cardano.Node.Tracing.Tracers.Peer
@@ -144,7 +145,7 @@ library
                       , async
                       , base16-bytestring
                       , bytestring
-                      , cardano-api ^>= 8.44
+                      , cardano-api ^>= 10.8
                       , cardano-crypto-class
                       , cardano-crypto-wrapper
                       , cardano-git-rev ^>=0.2.2
@@ -152,6 +153,7 @@ library
                       , cardano-ledger-allegra
                       , cardano-ledger-api
                       , cardano-ledger-babbage
+                      , cardano-ledger-binary
                       , cardano-ledger-byron
                       , cardano-ledger-conway
                       , cardano-ledger-core
@@ -162,53 +164,57 @@ library
                       , cborg ^>= 0.2.4
                       , containers
                       , contra-tracer
+                      , data-default-class
                       , deepseq
                       , directory
                       , dns
-                      , ekg
+                      , ekg-wai
                       , ekg-core
                       , filepath
                       , formatting
                       , generic-data
                       , hostname
                       , io-classes >= 1.4
-                      , iohk-monitoring
+                      , iohk-monitoring ^>= 0.2
                       , iproute
                       , lobemo-backend-aggregation
-                      , lobemo-backend-ekg
+                      , lobemo-backend-ekg ^>= 0.2
                       , lobemo-backend-monitoring
                       , lobemo-backend-trace-forwarder
                       , mtl
                       , network
-                      , network-mux >= 0.4
+                      , network-mux >= 0.5
                       , nothunks
                       , optparse-applicative-fork >= 0.18.1
-                      , ouroboros-consensus ^>= 0.17
-                      , ouroboros-consensus-cardano ^>= 0.15
-                      , ouroboros-consensus-diffusion ^>= 0.15
+                      , ouroboros-consensus ^>= 0.22
+                      , ouroboros-consensus-cardano ^>= 0.21
+                      , ouroboros-consensus-diffusion ^>= 0.20
                       , ouroboros-consensus-protocol
-                      , ouroboros-network-api ^>= 0.7.1
-                      , ouroboros-network ^>= 0.14
+                      , ouroboros-network-api ^>= 0.12
+                      , ouroboros-network ^>= 0.19.0.3
                       , ouroboros-network-framework
-                      , ouroboros-network-protocols ^>= 0.8
+                      , ouroboros-network-protocols ^>= 0.13
                       , prettyprinter
                       , prettyprinter-ansi-terminal
                       , psqueues
+                      , resource-registry
                       , safe-exceptions
                       , scientific
                       , si-timers
                       , sop-core
-                      , stm
+                      -- avoid stm-2.5.2 https://github.com/haskell/stm/issues/76
+                      , stm <2.5.2 || >=2.5.3
                       , strict-sop-core
                       , strict-stm
                       , time
-                      , trace-dispatcher ^>= 2.5
-                      , trace-forward ^>= 2.2
-                      , trace-resources ^>= 0.2.1.0
+                      , trace-dispatcher ^>= 2.8.1
+                      , trace-forward ^>= 2.2.10
+                      , trace-resources ^>= 0.2.3
                       , tracer-transformers
                       , transformers
                       , transformers-except
-                      , typed-protocols >= 0.1
+                      , typed-protocols >= 0.3
+                      , typed-protocols-stateful >= 0.3
                       , yaml
 
 executable cardano-node

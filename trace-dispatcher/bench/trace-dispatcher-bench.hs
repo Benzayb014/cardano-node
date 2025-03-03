@@ -6,7 +6,7 @@ import           Cardano.Logging.Test.Tracer
 import           Cardano.Logging.Test.Types
 
 import           Data.IORef
-import           System.Remote.Monitoring (forkServer)
+import           System.Remote.Monitoring.Wai (forkServer)
 
 import           Criterion.Main
 
@@ -107,7 +107,7 @@ ekgTracers confState = do
     forwardTrRef    <- newIORef []
     forwardTracer'  <- testTracer forwardTrRef
     ekgServer       <- forkServer "localhost" 8000
-    ekgTracer       <- ekgTracer (Right ekgServer)
+    ekgTracer       <- ekgTracer emptyTraceConfig (Right ekgServer)
     tr              <- mkCardanoTracer
                         stdoutTracer'
                         forwardTracer'

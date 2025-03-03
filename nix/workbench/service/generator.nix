@@ -67,9 +67,9 @@ let
 
           targetNodes = __mapAttrs
             (name: { name, port, ...}@nodeSpec:
-              { inherit port;
-                ip = let ip = nodePublicIP nodeSpec; # getPublicIp resources nodes name
-                     in __trace "generator target:  ${name}/${ip}:${toString port}" ip;
+              { inherit name port;
+                # "generator target ${name}: ${ip}:${toString port}"
+                ip = nodePublicIP nodeSpec; # getPublicIp resources nodes name
               })
             (filterAttrs (_: spec: spec.isProducer) nodeSpecs);
 
@@ -128,6 +128,43 @@ let
       start = rec {
         value = ''
           #!${pkgs.stdenv.shell}
+
+          ###########################################
+          # Extra workloads start ###################
+          ###########################################
+          ${builtins.concatStringsSep "" (builtins.map (workload:
+              let workload_name = workload.name;
+                  entrypoint = workload.entrypoints.pre_generator;
+                  node_name = if profile.composition.with_explorer
+                              then "explorer"
+                              else "node-0"
+                  ;
+              in
+                  ''
+                  ###########################################
+                  ########## workload start: ${workload_name}
+                  ###########################################
+                  ${if entrypoint != null
+                    then
+                      ''
+                      ${import ../workload/${workload_name}.nix
+                        {inherit pkgs profile nodeSpecs workload;}
+                      }
+                      (cd ../workloads/${workload_name} && ${entrypoint} ${node_name})
+                      ''
+                    else
+                      ''
+                      ''
+                  }
+                  ###########################################
+                  ########## workload end:   ${workload_name}
+                  ###########################################
+                  ''
+            ) (profile.workloads or []))
+          }
+          #############################################
+          # Extra workloads end #######################
+          #############################################
 
           ${service.script}
           '';

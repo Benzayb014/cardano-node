@@ -43,16 +43,15 @@ sumFieldsReport =
   , "ghc_version"
   ] ++ (FieldName <$> manifestPackages) ++
   [ "era"
-  , "delegators", "utxo"
+  , "delegators", "utxo", "dreps"
   , "add_tx_size", "inputs_per_tx", "outputs_per_tx" , "tps", "tx_count"
   , "plutusScript"
   , "sumHosts", "sumLogObjectsTotal"
   , "sumFilters"
-  , "cdfLogLinesEmitted", "cdfLogObjectsEmitted", "cdfLogObjects"
+  , "cdfLogObjectsEmitted", "cdfLogObjects"
   , "cdfRuntime", "cdfLogLineRate"
   , "ddRawCount.sumDomainTime", "ddFilteredCount.sumDomainTime", "dataDomainFilterRatio.sumDomainTime"
   , "ddRaw.sumStartSpread", "ddRaw.sumStopSpread"
-  , "ddFiltered.sumStartSpread", "ddFiltered.sumStopSpread"
   , "sumDomainSlots", "sumDomainBlocks", "sumBlocksRejected"]
 
 instance (KnownCDF f) => TimelineFields (Summary f)  where
@@ -95,8 +94,12 @@ instance (KnownCDF f) => TimelineFields (Summary f)  where
       ""
 
    <> fScalar "utxo"                   W12 Cnt (IWord64 $           utxo.sumGenesisSpec)
-      "Starting UTxO set size"
-      "Extra UTxO set size at the beginning of the benchmark"
+      "Stuffed UTxO size"
+      "Extra UTxO set entries (from genesis)"
+
+   <> fScalar "dreps"                  W12 Cnt (IWord64 $          dreps.sumGenesisSpec)
+      "DRep count"
+      "Amount of DReps in ledger, number of DRep delegations equals number of stake delegations"
 
    <> fScalar "add_tx_size"            W6  B   (IWord64 $      add_tx_size.sumWorkload
                                                                )
@@ -130,10 +133,6 @@ instance (KnownCDF f) => TimelineFields (Summary f)  where
 
    <> fScalar "sumFilters"             W2  Cnt (IInt   $   length.snd.sumFilters)
       "Number of filters applied"
-      ""
-
-   <> fScalar "cdfLogLinesEmitted"     W12 Cnt (IFloat $ cdfAverageVal.cdfLogLinesEmitted)
-      "Log text lines emitted per host"
       ""
 
    <> fScalar "cdfLogObjectsEmitted"   W12 Cnt (IFloat $ cdfAverageVal.cdfLogObjectsEmitted)
@@ -176,14 +175,6 @@ instance (KnownCDF f) => TimelineFields (Summary f)  where
       "Node stop spread, s"
       ""
 
-   <> fScalar "ddFiltered.sumStartSpread" W9 Sec (IDeltaT$ maybe 0 (intvDurationSec.fmap (fromRUTCTime . arityProj cdfMedian)).ddFiltered.sumStartSpread)
-      "Perf analysis start spread, s"
-      ""
-
-   <> fScalar "ddFiltered.sumStopSpread"  W9 Sec (IDeltaT$ maybe 0 (intvDurationSec.fmap (fromRUTCTime . arityProj cdfMedian)).ddFiltered.sumStopSpread)
-      "Perf analysis stop spread, s"
-      ""
-
    <> fScalar "sumDomainSlots"         W12 Slo (IInt  $ floor.arityProj cdfMedian.cdfAverage.ddFilteredCount.sumDomainSlots)
       "Slots analysed"
       ""
@@ -206,7 +197,6 @@ instance (KnownCDF f) => TimelineFields (Summary f)  where
                        [ manifestPackages <&> pkgVersion
                        , manifestPackages <&> pkgCommit
                        ]
-
 
 -- fieldJSONOverlay f = (:[]) . tryOverlayFieldDescription f
 

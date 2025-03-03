@@ -25,20 +25,21 @@ jobs:
     name: "Wait for hydra check-runs"
     runs-on: ubuntu-latest
     steps:
-    - name: Get specific check run status
+    - name: Waiting for ci/hydra-build:required to complete
       run: |
         while [[ true ]]; do
-          conclusion=$(gh api repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs --jq '.check_runs[] | select(.name == "ci/hydra-build:required") | .conclusion')
+          check_name='ci/hydra-build:required'
+          conclusion=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=$check_name" --jq '.check_runs[].conclusion')
           case "$conclusion" in
             success)
-              echo "ci/hydra-build:required succeeded"
+              echo "$check_name succeeded"
               exit 0;;
-            failure)
-              echo "ci/hydra-build:required failed"
-              exit 1;;
-            *)
-              echo "ci/hydra-build:required pending. Waiting 30s..."
+            '')
+              echo "$check_name pending. Waiting 30s..."
               sleep 30;;
+            *)
+              echo "$check_name terminated unsuccessfully"
+              exit 1;;
           esac
         done
     
@@ -78,7 +79,7 @@ jobs:
               cp result/cardano-node-*-*.zip .
               ;;              
           esac
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ github.sha }}-${{ matrix.arch }}       
           path: cardano-node-*-*.*
@@ -89,15 +90,18 @@ jobs:
     name: "Upload Assets"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
-          name: ${{ github.sha }}-linux
-      - uses: actions/download-artifact@v3
-        with:
-          name: ${{ github.sha }}-macos
-      - uses: actions/download-artifact@v3
-        with:
-          name: ${{ github.sha }}-win64
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          # find returns something like this:
+          # "cardano-node-8.11.0-linux.tar.gz cardano-node-8.11.0-macos.tar.gz ..."
+          # We use the first member of this list to compute the prefix "cardano-node-8.11.0"
+          first_archive=$(find . -maxdepth 1 -name "cardano-node-*" -printf '%P\n' | head -n 1)
+          # Then we trim the architecture-specific suffix (last "-" and after)
+          sha256sums_filename=$(echo "${first_archive%-*}-sha256sums.txt")
+          sha256sum cardano-node-* >> "$sha256sums_filename"
       - name: Release
         uses: input-output-hk/action-gh-release@v1
         with:
@@ -106,3 +110,4 @@ jobs:
             cardano-node-*-win64.zip
             cardano-node-*-macos.tar.gz
             cardano-node-*-linux.tar.gz
+            cardano-node-*-sha256sums.txt

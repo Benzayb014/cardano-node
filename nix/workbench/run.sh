@@ -569,10 +569,17 @@ EOF
         cp "$dir"/genesis/genesis-shelley.json "$dir"/genesis-shelley.json
         cp "$dir"/genesis/genesis.alonzo.json  "$dir"/genesis.alonzo.json
         echo >&2
+        ## Add global_basedir Voltaire Plutus guardrails script
+        cp "$global_basedir"/genesis/guardrails-script.plutus "$dir"/genesis/
 
         ## 8. deploy genesis
         progress "run | genesis" "deploying.."
-        backend deploy-genesis "$dir"
+        (
+          # This step is resource intensive so we use a lockfile to avoid
+          # running it in parallel to a benchmark.
+          acquire_lock
+          backend deploy-genesis "$dir"
+        )
 
         ## 9. everything needed to start-[tracers|nodes|generator] should be
         ##    ready
@@ -691,7 +698,7 @@ EOF
            then fail "fetch-analysis:  run has not been analysed on remote: $(white $run)"
            else local analysis_files=(
                    $(ssh $env -- \
-                     sh -c "'cd $depl/$dir/$run && ls analysis/{cdf/*.cdf,*.{json,org,txt}} | fgrep -v -e flt.json -e flt.logobjs.json -e flt.perf-stats.json'" \
+                     sh -c "'cd $depl/$dir/$run && ls analysis/{cdf/*.cdf,*.{json,org,txt}} | fgrep -v -e flt.json -e logobjs.json -e perf-stats.json -e mach-views.json'" \
                      2>/dev/null)
                 )
                 local args=(
@@ -814,7 +821,12 @@ EOF
         local scenario=${scenario_override:-$(jq -r .scenario "$dir"/profile.json)}
         scenario "$scenario" "$dir"
 
-        backend fetch-logs     "$dir"
+        (
+          # This step is resource intensive so we use a lockfile to avoid
+          # running it in parallel to a benchmark.
+          acquire_lock
+          backend fetch-logs     "$dir"
+        )
         backend stop-cluster   "$dir"
 
         run compat-meta-fixups "$run"
@@ -890,11 +902,11 @@ run_remote_get() {
     jq . <<<$meta > $dir/meta.json
 
     local common_run_files=(
-        genesis-alonzo.json
+        genesis.alonzo.json
         genesis-shelley.json
-        machines.json
-        network-latency-matrix.json
         profile.json
+        generator/protocol-parameters-queried.json
+        generator/plutus-budget-summary.json
     )
     local xs0=(${objects[*]})
     local xs1=(${xs0[*]/#all-hosts/        $(jq -r '.hostname | keys | .[]' <<<$meta)})

@@ -37,7 +37,7 @@ function workbench-prebuild-executables()
     newline
 
     unset NIX_ENFORCE_PURITY
-    for exe in cardano-node cardano-topology cardano-tracer tx-generator locli
+    for exe in cardano-node cardano-profile cardano-topology cardano-tracer tx-generator locli
     do echo "workbench:  $(blue prebuilding) $(red $exe)"
        verbose "exec"                         "cabal build ${WB_FLAGS_CABAL} -- exe:$exe"
        cabal $(test -z "${verbose:-}" && echo '-v0') build ${WB_FLAGS_CABAL} -- exe:$exe || return 1
@@ -50,6 +50,10 @@ function cardano-node() {
     ${WB_NODE_EXECPREFIX} cabal -v0 run   ${WB_FLAGS_CABAL} exe:cardano-node     -- ${WB_FLAGS_RTS} "$@"
 }
 
+function cardano-profile() {
+                          cabal -v0 run   ${WB_FLAGS_CABAL} exe:cardano-profile  -- ${WB_FLAGS_RTS} "$@"
+}
+
 function cardano-topology() {
                           cabal -v0 run   ${WB_FLAGS_CABAL} exe:cardano-topology -- ${WB_FLAGS_RTS} "$@"
 }
@@ -59,11 +63,13 @@ function cardano-tracer() {
 }
 
 function locli() {
-    cabal -v0 build ${WB_FLAGS_CABAL} exe:locli
-    set-git-rev \
-        $(git rev-parse HEAD) \
-        $(cabal list-bin locli) || true
-                          cabal -v0 exec  ${WB_FLAGS_CABAL}     locli            -- ${WB_FLAGS_RTS} "$@"
+    #cabal -v0 build ${WB_FLAGS_CABAL} exe:locli
+    #set-git-rev \
+    #    $(git rev-parse HEAD) \
+    #    $(cabal list-bin locli) || true
+    #                     cabal -v0 exec  ${WB_FLAGS_CABAL}     locli            -- ${WB_FLAGS_RTS} "$@"
+
+                          cabal -v0 run   ${WB_FLAGS_CABAL} exe:locli            -- ${WB_FLAGS_RTS} "$@"
 }
 
 function tx-generator() {
@@ -72,4 +78,4 @@ function tx-generator() {
 
 export WB_MODE_CABAL=t
 
-export -f cardano-node cardano-topology cardano-tracer locli tx-generator
+export -f cardano-node cardano-profile cardano-topology cardano-tracer locli tx-generator

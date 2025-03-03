@@ -14,7 +14,8 @@ import           Cardano.Logging hiding (traceWith)
 import           Cardano.Node.Orphans ()
 import           Cardano.Node.Queries
 import           Ouroboros.Consensus.Block (Header)
-import           Ouroboros.Consensus.Util.NormalForm.StrictTVar (StrictTVar, readTVar)
+import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client (ChainSyncClientHandle,
+                   csCandidate, cschcMap, viewChainSyncState)
 import           Ouroboros.Consensus.Util.Orphans ()
 import qualified Ouroboros.Network.AnchoredFragment as Net
 import           Ouroboros.Network.Block (unSlotNo)
@@ -38,25 +39,35 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as Text
+import           GHC.Conc (labelThread, myThreadId)
 import           Text.Printf (printf)
 
 {- HLINT ignore "Use =<<" -}
 {- HLINT ignore "Use <=<" -}
 
+-- | Starts a background thread to periodically trace the current peer list.
+-- The thread is linked to the parent thread for proper error propagation
+-- and labeled for easier debugging and identification.
 startPeerTracer
-  :: Tracer IO [PeerT blk]
-  -> NodeKernelData blk
-  -> Int
+  :: Tracer IO [PeerT blk]  -- ^ Tracer for the peer list
+  -> NodeKernelData blk     -- ^ Node kernel containing peer data
+  -> Int                    -- ^ Delay in milliseconds between traces
   -> IO ()
-startPeerTracer tr nodeKern delayMilliseconds = do
-    as <- async peersThread
-    link as
+startPeerTracer tracer nodeKernel delayMilliseconds = do
+  thread <- async peersThread
+  -- Link the thread to the parent to propagate exceptions properly.
+  link thread
   where
+    -- | The background thread that periodically traces the peer list.
     peersThread :: IO ()
-    peersThread = forever $ do
-          peers <- getCurrentPeers nodeKern
-          traceWith tr peers
-          threadDelay (delayMilliseconds * 1000)
+    peersThread = do
+      -- Label the thread for easier debugging and identification.
+      myThreadId >>= flip labelThread "Peer Tracer"
+      forever $ do
+        peers <- getCurrentPeers nodeKernel
+        traceWith tracer peers
+        threadDelay (delayMilliseconds * 1000)
+
 
 data PeerT blk = PeerT
     RemoteConnectionId
@@ -102,9 +113,9 @@ getCurrentPeers nkd = mapNodeKernelDataIO extractPeers nkd
   tuple3pop (a, b, _) = (a, b)
 
   getCandidates
-    :: StrictTVar IO (Map peer (StrictTVar IO (Net.AnchoredFragment (Header blk))))
+    :: STM.STM IO (Map peer (ChainSyncClientHandle IO blk))
     -> STM.STM IO (Map peer (Net.AnchoredFragment (Header blk)))
-  getCandidates var = readTVar var >>= traverse readTVar
+  getCandidates handle = viewChainSyncState handle csCandidate
 
   extractPeers :: NodeKernel IO RemoteAddress LocalConnectionId blk
                 -> IO [PeerT blk]
@@ -114,7 +125,7 @@ getCurrentPeers nkd = mapNodeKernelDataIO extractPeers nkd
                                        . Net.readFetchClientsStateVars
                                        . getFetchClientRegistry $ kernel
                                      )
-    candidates <- STM.atomically . getCandidates . getNodeCandidates $ kernel
+    candidates <- STM.atomically . getCandidates . cschcMap . getChainSyncHandles $ kernel
 
     let peers = flip Map.mapMaybeWithKey candidates $ \cid af ->
                   maybe Nothing
@@ -132,7 +143,7 @@ instance LogFormatting [PeerT blk] where
     [ "peers" .= toJSON (List.foldl' (\acc x -> forMachine dtal x : acc) [] xs)
     ]
   forHuman peers = Text.concat $ List.intersperse ", " (map ppPeer peers)
-  asMetrics peers = [IntM "Net.PeersFromNodeKernel" (fromIntegral (length peers))]
+  asMetrics peers = [IntM "peersFromNodeKernel" (fromIntegral (length peers))]
 
 instance LogFormatting (PeerT blk) where
   forMachine _dtal (PeerT cid _af status inflight) =
@@ -158,6 +169,6 @@ instance MetaTrace [PeerT blk] where
   documentFor _ns =
     Nothing
   metricsDocFor (Namespace _ ["PeersFromNodeKernel"]) =
-    [("Net.PeersFromNodeKernel","")]
+    [("peersFromNodeKernel","")]
   metricsDocFor _ns = []
   allNamespaces = [ Namespace [] ["PeersFromNodeKernel"]]

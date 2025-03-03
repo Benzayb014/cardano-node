@@ -33,6 +33,7 @@ import           Cardano.Node.Tracing.Tracers.ForgingThreadStats (forgeThreadSta
 import           Cardano.Node.Tracing.Tracers.KESInfo
 import           Cardano.Node.Tracing.Tracers.NodeToClient ()
 import           Cardano.Node.Tracing.Tracers.NodeToNode ()
+import           Cardano.Node.Tracing.Tracers.NodeVersion (getNodeVersion)
 import           Cardano.Node.Tracing.Tracers.NonP2P ()
 import           Cardano.Node.Tracing.Tracers.P2P ()
 import           Cardano.Node.Tracing.Tracers.Peer ()
@@ -125,6 +126,10 @@ mkDispatchTracers nodeKernel trBase trForward mbTrEKG trDataPoint trConfig enabl
     !chainDBTr <- mkCardanoTracer' trBase trForward mbTrEKG ["ChainDB"]
                                     withAddedToCurrentChainEmptyLimited
     configureTracers configReflection trConfig [chainDBTr]
+
+    !nodeVersionTr <- mkCardanoTracer trBase trForward mbTrEKG ["Version"]
+    configureTracers configReflection trConfig  [nodeVersionTr]
+
     -- Filter out replayed blocks for this tracer
     let chainDBTr' = filterTrace
                       (\case (_, ChainDB.TraceLedgerReplayEvent
@@ -170,6 +175,8 @@ mkDispatchTracers nodeKernel trBase trForward mbTrEKG trDataPoint trConfig enabl
 
     traceEffectiveConfiguration trBase trForward trConfig
 
+    traceWith nodeVersionTr getNodeVersion
+
     pure Tracers
       {
         chainDBTracer = Tracer (traceWith chainDBTr')
@@ -188,6 +195,7 @@ mkDispatchTracers nodeKernel trBase trForward mbTrEKG trDataPoint trConfig enabl
       , nodeStartupInfoTracer = Tracer (traceWith nodeStartupInfoDP)
       , nodeStateTracer = Tracer (traceWith stateTr)
                           <> Tracer (traceWith nodeStateDP)
+      , nodeVersionTracer = Tracer (traceWith nodeVersionTr)
       , resourcesTracer = Tracer (traceWith resourcesTr)
       , peersTracer     = Tracer (traceWith peersTr)
                           <> Tracer (traceNodePeers nodePeersDP)
@@ -233,6 +241,11 @@ mkConsensusTracers configReflection trBase trForward mbTrEKG _trDataPoint trConf
                 ["ChainSync", "ServerBlock"]
     configureTracers configReflection trConfig [chainSyncServerBlockTr]
 
+    !consensusSanityCheckTr <- mkCardanoTracer
+                 trBase trForward mbTrEKG
+                 ["Consensus", "SanityCheck"]
+    configureTracers configReflection trConfig [consensusSanityCheckTr]
+
     !blockFetchDecisionTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["BlockFetch", "Decision"]
@@ -257,6 +270,8 @@ mkConsensusTracers configReflection trBase trForward mbTrEKG _trDataPoint trConf
                 trBase trForward mbTrEKG
                 ["BlockFetch", "Server"]
     configureTracers configReflection trConfig [blockFetchServerTr]
+
+    !servedBlockLatestTr <- servedBlockLatest mbTrEKG
 
     !forgeKESInfoTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
@@ -308,12 +323,22 @@ mkConsensusTracers configReflection trBase trForward mbTrEKG _trDataPoint trConf
     !consensusStartupErrorTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Consensus", "Startup"]
+    configureTracers configReflection trConfig [consensusStartupErrorTr]
+
+    !consensusGddTr <- mkCardanoTracer
+                 trBase trForward mbTrEKG
+                 ["Consensus", "GDD"]
+    configureTracers configReflection trConfig [consensusGddTr]
 
     !consensusGsmTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Consensus", "GSM"]
+    configureTracers configReflection trConfig [consensusGsmTr]
 
-    configureTracers configReflection trConfig [consensusStartupErrorTr]
+    !consensusCsjTr <- mkCardanoTracer
+                trBase trForward mbTrEKG
+                ["Consensus", "CSJ"]
+    configureTracers configReflection trConfig [consensusCsjTr]
 
     pure $ Consensus.Tracers
       { Consensus.chainSyncClientTracer = Tracer $
@@ -323,6 +348,8 @@ mkConsensusTracers configReflection trBase trForward mbTrEKG _trDataPoint trConf
            <> traceWith chainSyncServerHeaderMetricsTr
       , Consensus.chainSyncServerBlockTracer = Tracer $
           traceWith chainSyncServerBlockTr
+      , Consensus.consensusSanityCheckTracer = Tracer $
+          traceWith consensusSanityCheckTr
       , Consensus.blockFetchDecisionTracer = Tracer $
           traceWith blockFetchDecisionTr
       , Consensus.blockFetchClientTracer = Tracer $
@@ -330,8 +357,11 @@ mkConsensusTracers configReflection trBase trForward mbTrEKG _trDataPoint trConf
            <> traceWith blockFetchClientMetricsTr
       , Consensus.blockFetchServerTracer = Tracer $
           traceWith blockFetchServerTr
+          <> traceWith servedBlockLatestTr
       , Consensus.forgeStateInfoTracer = Tracer $
           traceWith (traceAsKESInfo (Proxy @blk) forgeKESInfoTr)
+      , Consensus.gddTracer = Tracer $
+          traceWith consensusGddTr
       , Consensus.txInboundTracer = Tracer $
            traceWith txInboundTr
       , Consensus.txOutboundTracer = Tracer $
@@ -352,6 +382,8 @@ mkConsensusTracers configReflection trBase trForward mbTrEKG _trDataPoint trConf
           traceWith consensusStartupErrorTr . ConsensusStartupException
       , Consensus.gsmTracer = Tracer $
           traceWith consensusGsmTr
+      , Consensus.csjTracer = Tracer $
+          traceWith consensusCsjTr
       }
 
 mkNodeToClientTracers :: forall blk.
@@ -436,6 +468,11 @@ mkNodeToNodeTracers configReflection trBase trForward mbTrEKG _trDataPoint trCon
                 ["TxSubmission", "Remote"]
     configureTracers configReflection trConfig [txSubmission2Tracer]
 
+    !keepAliveTracer  <-  mkCardanoTracer
+                trBase trForward mbTrEKG
+                ["KeepAlive", "Remote"]
+    configureTracers configReflection trConfig [keepAliveTracer]
+
     pure $ NtN.Tracers
       { NtN.tChainSyncTracer = Tracer $
           traceWith chainSyncTracer
@@ -447,6 +484,8 @@ mkNodeToNodeTracers configReflection trBase trForward mbTrEKG _trDataPoint trCon
           traceWith blockFetchSerialisedTr
       , NtN.tTxSubmission2Tracer = Tracer $
           traceWith txSubmission2Tracer
+      , NtN.tKeepAliveTracer = Tracer $
+          traceWith keepAliveTracer
       }
 
 mkDiffusionTracers
@@ -539,6 +578,11 @@ mkDiffusionTracersExtra configReflection trBase trForward mbTrEKG _trDataPoint t
       ["Net", "PeerSelection"]
     configureTracers configReflection trConfig [peerSelectionCountersTr]
 
+    !churnCountersTr  <-  mkCardanoTracer
+      trBase trForward mbTrEKG
+      ["Net", "Churn"]
+    configureTracers configReflection trConfig [churnCountersTr]
+
     !peerSelectionActionsTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "PeerSelection", "Actions"]
@@ -602,6 +646,8 @@ mkDiffusionTracersExtra configReflection trBase trForward mbTrEKG _trDataPoint t
                  traceWith debugPeerSelectionResponderTr
              , P2P.dtTracePeerSelectionCounters = Tracer $
                  traceWith peerSelectionCountersTr
+             , P2P.dtTraceChurnCounters = Tracer $
+                 traceWith churnCountersTr
              , P2P.dtPeerSelectionActionsTracer = Tracer $
                  traceWith peerSelectionActionsTr
              , P2P.dtConnectionManagerTracer = Tracer $

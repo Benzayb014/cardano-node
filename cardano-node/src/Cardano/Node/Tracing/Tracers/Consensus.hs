@@ -10,6 +10,7 @@
 {-# LANGUAGE UndecidableInstances #-}
 
 {-# OPTIONS_GHC -Wno-orphans  #-}
+{-# LANGUAGE InstanceSigs #-}
 
 module Cardano.Node.Tracing.Tracers.Consensus
   (
@@ -18,6 +19,7 @@ module Cardano.Node.Tracing.Tracers.Consensus
   , forgeTracerTransform
   , initialClientMetrics
   , calculateBlockFetchClientMetrics
+  , servedBlockLatest
   , ClientMetrics
   ) where
 
@@ -30,20 +32,26 @@ import           Cardano.Node.Tracing.Formatting ()
 import           Cardano.Node.Tracing.Render
 import           Cardano.Node.Tracing.Tracers.ConsensusStartupException ()
 import           Cardano.Node.Tracing.Tracers.StartLeadershipCheck
+import           Cardano.Tracing.OrphanInstances.Network (Verbose (..))
 import           Cardano.Protocol.TPraos.OCert (KESPeriod (..))
 import           Cardano.Slotting.Slot (WithOrigin (..))
 import           Ouroboros.Consensus.Block
 import           Ouroboros.Consensus.BlockchainTime (SystemStart (..))
 import           Ouroboros.Consensus.BlockchainTime.WallClock.Util (TraceBlockchainTimeEvent (..))
 import           Ouroboros.Consensus.Cardano.Block
+import           Ouroboros.Consensus.Genesis.Governor (DensityBounds (..), GDDDebugInfo (..),
+                   TraceGDDEvent (..))
+import           Ouroboros.Consensus.Ledger.Extended (ExtValidationError)
 import           Ouroboros.Consensus.Ledger.Inspect (LedgerEvent (..), LedgerUpdate, LedgerWarning)
-import           Ouroboros.Consensus.Ledger.SupportsMempool (ApplyTxErr, GenTxId, HasTxId,
-                   LedgerSupportsMempool, txForgetValidated, txId)
+import           Ouroboros.Consensus.Ledger.SupportsMempool (ApplyTxErr, ByteSize32 (..), GenTxId,
+                   HasTxId, LedgerSupportsMempool, txForgetValidated, txId)
 import           Ouroboros.Consensus.Ledger.SupportsProtocol
 import           Ouroboros.Consensus.Mempool (MempoolSize (..), TraceEventMempool (..))
 import           Ouroboros.Consensus.MiniProtocol.BlockFetch.Server
                    (TraceBlockFetchServerEvent (..))
 import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client
+import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping as Jumping
+import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client.State (JumpInfo (..))
 import           Ouroboros.Consensus.MiniProtocol.ChainSync.Server
 import           Ouroboros.Consensus.MiniProtocol.LocalTxSubmission.Server
                    (TraceLocalTxSubmissionServerEvent (..))
@@ -58,6 +66,7 @@ import           Ouroboros.Network.Block hiding (blockPrevHash)
 import           Ouroboros.Network.BlockFetch.ClientState (TraceLabelPeer (..))
 import qualified Ouroboros.Network.BlockFetch.ClientState as BlockFetch
 import           Ouroboros.Network.BlockFetch.Decision
+import           Ouroboros.Network.BlockFetch.Decision.Trace (TraceDecisionEvent (..))
 import           Ouroboros.Network.ConnectionId (ConnectionId (..))
 import           Ouroboros.Network.DeltaQ (GSV (..), PeerGSV (..))
 import           Ouroboros.Network.KeepAlive (TraceKeepAliveClient (..))
@@ -65,16 +74,20 @@ import           Ouroboros.Network.SizeInBytes (SizeInBytes (..))
 import           Ouroboros.Network.TxSubmission.Inbound hiding (txId)
 import           Ouroboros.Network.TxSubmission.Outbound
 
+import           Control.Monad (guard)
 import           Control.Monad.Class.MonadTime.SI (Time (..))
 import           Data.Aeson (ToJSON, Value (Number, String), toJSON, (.=))
 import qualified Data.Aeson as Aeson
-import           Data.Foldable (Foldable (..))
+import           Data.Foldable (Foldable (toList))
 import           Data.Int (Int64)
 import           Data.IntPSQ (IntPSQ)
 import qualified Data.IntPSQ as Pq
+import qualified Data.List as List
 import qualified Data.Text as Text
 import           Data.Time (DiffTime, NominalDiffTime)
 import           Data.Word (Word32, Word64)
+import           Network.TypedProtocol.Core
+
 
 instance (LogFormatting adr, Show adr) => LogFormatting (ConnectionId adr) where
   forMachine _dtal (ConnectionId local' remote) =
@@ -190,6 +203,42 @@ instance (ConvertRawHash blk, LedgerSupportsProtocol blk)
         , "the considered header and the best block number known prior to this"
         , "header"
         ]
+    TraceOfferJump point ->
+      mconcat
+        [ "ChainSync Jumping -- we are offering a jump to the server, to point: "
+        , showT point
+        ]
+    TraceJumpResult (AcceptedJump instruction) ->
+      mconcat
+        [ "ChainSync Jumping -- the client accepted the jump to "
+        , showT (jumpInstructionToPoint instruction)
+        ]
+    TraceJumpResult (RejectedJump instruction) ->
+      mconcat
+        [ "ChainSync Jumping -- the client rejected the jump to "
+        , showT (jumpInstructionToPoint instruction)
+        ]
+    TraceJumpingWaitingForNextInstruction ->
+      "ChainSync Jumping -- the client is blocked, waiting for its next instruction."
+    TraceJumpingInstructionIs RunNormally ->
+      "ChainSyncJumping -- the client is asked to run normally"
+    TraceJumpingInstructionIs Restart ->
+      mconcat
+        [ "ChainSyncJumping -- the client is asked to restart. This is necessary"
+        , "when disengaging a peer of which we know no point that we could set"
+        , "the intersection of the ChainSync server to."
+        ]
+    TraceJumpingInstructionIs (JumpInstruction instruction) ->
+      mconcat
+        [ "ChainSync Jumping -- the client is asked to jump to "
+        , showT (jumpInstructionToPoint instruction)
+        ]
+    TraceDrainingThePipe n ->
+      "ChainSync client is draining the pipe. Pipelined messages expected: " <> showT (natToInt n)
+    where
+      jumpInstructionToPoint = AF.headPoint . jTheirFragment . \case
+        JumpTo ji          -> ji
+        JumpToGoodPoint ji -> ji
 
   forMachine dtal = \case
     TraceDownloadedHeader h ->
@@ -238,6 +287,54 @@ instance (ConvertRawHash blk, LedgerSupportsProtocol blk)
         , "headerHash" .= showT (headerHash header)
         , "blockNo" .= aBlockNo
         ]
+    TraceOfferJump point ->
+      mconcat
+        [ "kind" .= String "TraceOfferJump"
+        , "point" .= showT point
+        ]
+    TraceJumpResult jumpResult ->
+      mconcat
+        [ "kind" .= String "TraceJumpResult"
+        , "result" .= case jumpResult of
+            AcceptedJump _ -> String "AcceptedJump"
+            RejectedJump _ -> String "RejectedJump"
+        ]
+    TraceJumpingWaitingForNextInstruction ->
+      mconcat
+        [ "kind" .= String "TraceJumpingWaitingForNextInstruction"
+        ]
+    TraceJumpingInstructionIs instruction ->
+      mconcat
+        [ "kind" .= String "TraceJumpingInstructionIs"
+        , "instr" .= instructionToObject instruction
+        ]
+    TraceDrainingThePipe n ->
+      mconcat
+        [ "kind" .= String "TraceDrainingThePipe"
+        , "n" .= natToInt n
+        ]
+    where
+      instructionToObject :: Instruction blk -> Aeson.Object
+      instructionToObject = \case
+        RunNormally ->
+          mconcat ["kind" .= String "RunNormally"]
+        Restart ->
+          mconcat ["kind" .= String "Restart"]
+        JumpInstruction info ->
+          mconcat [ "kind" .= String "JumpInstruction"
+                  , "payload" .= jumpInstructionToObject info
+                  ]
+
+      jumpInstructionToObject :: JumpInstruction blk -> Aeson.Object
+      jumpInstructionToObject = \case
+        JumpTo info ->
+          mconcat [ "kind" .= String "JumpTo"
+                  , "point" .= showT (jumpInfoToPoint info) ]
+        JumpToGoodPoint info ->
+          mconcat [ "kind" .= String "JumpToGoodPoint"
+                  , "point" .= showT (jumpInfoToPoint info) ]
+
+      jumpInfoToPoint = AF.headPoint . jTheirFragment
 
 tipToObject :: forall blk. ConvertRawHash blk => Tip blk -> Aeson.Object
 tipToObject = \case
@@ -272,6 +369,16 @@ instance MetaTrace (TraceChainSyncClientEvent blk) where
       Namespace [] ["AccessingForecastHorizon"]
     TraceGaveLoPToken {} ->
       Namespace [] ["GaveLoPToken"]
+    TraceOfferJump _ ->
+      Namespace [] ["OfferJump"]
+    TraceJumpResult _ ->
+      Namespace [] ["JumpResult"]
+    TraceJumpingWaitingForNextInstruction ->
+      Namespace [] ["JumpingWaitingForNextInstruction"]
+    TraceJumpingInstructionIs _ ->
+      Namespace [] ["JumpingInstructionIs"]
+    TraceDrainingThePipe _ ->
+      Namespace [] ["DrainingThePipe"]
 
   severityFor ns _ =
     case ns of
@@ -292,6 +399,16 @@ instance MetaTrace (TraceChainSyncClientEvent blk) where
       Namespace _ ["AccessingForecastHorizon"] ->
         Just Debug
       Namespace _ ["GaveLoPToken"] ->
+        Just Debug
+      Namespace _ ["OfferJump"] ->
+        Just Debug
+      Namespace _ ["JumpResult"] ->
+        Just Debug
+      Namespace _ ["JumpingWaitingForNextInstruction"] ->
+        Just Debug
+      Namespace _ ["JumpingInstructionIs"] ->
+        Just Debug
+      Namespace _ ["DrainingThePipe"] ->
         Just Debug
       _ ->
         Nothing
@@ -322,6 +439,16 @@ instance MetaTrace (TraceChainSyncClientEvent blk) where
         Just "The slot number, which was previously beyond the forecast horizon, has now entered it"
       Namespace _ ["GaveLoPToken"] ->
         Just "May have added atoken to the LoP bucket of the peer"
+      Namespace _ ["OfferJump"] ->
+        Just "Offering a jump to the remote peer"
+      Namespace _ ["JumpResult"] ->
+        Just "Response to a jump offer (accept or reject)"
+      Namespace _ ["JumpingWaitingForNextInstruction"] ->
+        Just "The client is waiting for the next instruction"
+      Namespace _ ["JumpingInstructionIs"] ->
+        Just "The client got its next instruction"
+      Namespace _ ["DrainingThePipe"] ->
+        Just "The client is draining the pipe of messages"
       _ ->
         Nothing
 
@@ -335,6 +462,11 @@ instance MetaTrace (TraceChainSyncClientEvent blk) where
     , Namespace [] ["WaitingBeyondForecastHorizon"]
     , Namespace [] ["AccessingForecastHorizon"]
     , Namespace [] ["GaveLoPToken"]
+    , Namespace [] ["OfferJump"]
+    , Namespace [] ["JumpResult"]
+    , Namespace [] ["JumpingWaitingForNextInstruction"]
+    , Namespace [] ["JumpingInstructionIs"]
+    , Namespace [] ["DrainingThePipe"]
     ]
 
 --------------------------------------------------------------------------------
@@ -355,7 +487,8 @@ instance ConvertRawHash blk
                <> [ "risingEdge" .= True | RisingEdge <- [enclosing] ]
 
   asMetrics (TraceChainSyncServerUpdate _tip (AddBlock _pt) _blocking FallingEdge) =
-      [CounterM "ChainSync.HeadersServed.Falling" Nothing]
+      [CounterM "served.header" Nothing]
+  asMetrics (TraceChainSyncServerUpdate _tip (AddBlock _pt) _blocking _) = []
   asMetrics _ = []
 
 instance MetaTrace (TraceChainSyncServerEvent blk) where
@@ -370,8 +503,7 @@ instance MetaTrace (TraceChainSyncServerEvent blk) where
   severityFor _ _ = Nothing
 
   metricsDocFor (Namespace _ ["Update"]) =
-    [ ("ChainSync.HeadersServed", "A counter triggered on any header event")
-    , ("ChainSync.HeadersServed.Falling",
+    [ ("served.header",
         "A counter triggered only on header event with falling edge")]
   metricsDocFor _ = []
 
@@ -386,15 +518,12 @@ instance MetaTrace (TraceChainSyncServerEvent blk) where
 --------------------------------------------------------------------------------
 
 data CdfCounter = CdfCounter {
-    limit :: Int64
-  , counter :: Int64
+    limit   :: !Int64
+  , counter :: !Int64
 }
 
-decCdf :: Ord a => Num a => a -> CdfCounter -> CdfCounter
-decCdf v cdf =
-  if v < fromIntegral (limit cdf)
-    then cdf {counter = counter cdf - 1}
-    else cdf
+decCdf :: a -> CdfCounter -> CdfCounter
+decCdf _v cdf = cdf  {counter = counter cdf - 1}
 
 incCdf ::Ord a => Num a => a -> CdfCounter -> CdfCounter
 incCdf v cdf =
@@ -402,14 +531,16 @@ incCdf v cdf =
     then cdf {counter = counter cdf + 1}
     else cdf
 
+
 data ClientMetrics = ClientMetrics {
-    cmSlotMap  :: IntPSQ Word64 NominalDiffTime
-  , cmCdf1sVar :: CdfCounter
-  , cmCdf3sVar :: CdfCounter
-  , cmCdf5sVar :: CdfCounter
-  , cmDelay    :: Double
+    cmSlotMap   :: IntPSQ Word64 NominalDiffTime
+  , cmCdf1sVar  :: !CdfCounter
+  , cmCdf3sVar  :: !CdfCounter
+  , cmCdf5sVar  :: !CdfCounter
+  , cmDelay     :: Double
   , cmBlockSize :: Word32
-  , cmTraceIt  :: Bool
+  , cmTraceIt   :: Bool
+  , cmTraceVars :: Bool
 }
 
 instance LogFormatting ClientMetrics where
@@ -417,38 +548,41 @@ instance LogFormatting ClientMetrics where
   asMetrics ClientMetrics {..} =
     if cmTraceIt
       then
-        let  size = Pq.size cmSlotMap
-             msgs =
-               [ DoubleM
-                    "Blockfetch.Client.Blockdelay"
-                    cmDelay
-               , IntM
-                    "Blockfetch.Client.Blocksize"
-                    (fromIntegral cmBlockSize)
-               , DoubleM "Blockfetch.Client.Blockdelay.cdfOne"
-                    (fromIntegral (counter cmCdf1sVar) / fromIntegral size)
-               , DoubleM "Blockfetch.Client.Blockdelay.cdfThree"
-                    (fromIntegral (counter cmCdf3sVar) / fromIntegral size)
-               , DoubleM "Blockfetch.Client.Blockdelay.cdfFive"
-                    (fromIntegral (counter cmCdf5sVar) / fromIntegral size)
-               ]
-        in if cmDelay > 5
-             then
-               CounterM "Blockfetch.Client.Lateblocks" Nothing
-                 : msgs
-             else msgs
-      else []
+        let size = Pq.size cmSlotMap
+            msgs =
+              [ DoubleM "blockfetchclient.blockdelay" cmDelay
+              , IntM "blockfetchclient.blocksize" (fromIntegral cmBlockSize)
+              ]
+              <> if cmTraceVars
+                    then  cdfMetric "blockfetchclient.blockdelay.cdfOne" cmCdf1sVar
+                          <> cdfMetric "blockfetchclient.blockdelay.cdfThree" cmCdf3sVar
+                          <> cdfMetric "blockfetchclient.blockdelay.cdfFive" cmCdf5sVar
+                          <> lateBlockMetric cmDelay
+                    else []
+                      where
+                        cdfMetric name var =
+                          [ DoubleM name (fromIntegral (counter var) / fromIntegral size)
+                          ]
+
+                        lateBlockMetric delay =
+                          [ CounterM "blockfetchclient.lateblocks" Nothing
+                          | delay > 5
+                          ]
+        in msgs
+    else []
 
 instance MetaTrace ClientMetrics where
   namespaceFor _ = Namespace [] ["ClientMetrics"]
-  severityFor _ _ = Just Info
+  severityFor _ _ = Just Debug
   documentFor _ = Just ""
 
   metricsDocFor (Namespace _ ["ClientMetrics"]) =
-      [ ("Blockfetch.Client.Blockdelay", "")
-      , ("Blockfetch.Client.Blockdelay.cdfOne", "")
-      , ("Blockfetch.Client.Blockdelay.cdfThree", "")
-      , ("Blockfetch.Client.Blockdelay.cdfFive", "")
+      [ ("blockfetchclient.blockdelay", "")
+      , ("blockfetchclient.blocksize", "")
+      , ("blockfetchclient.lateblocks", "")
+      , ("blockfetchclient.blockdelay.cdfOne", "")
+      , ("blockfetchclient.blockdelay.cdfThree", "")
+      , ("blockfetchclient.blockdelay.cdfFive", "")
       ]
   metricsDocFor _ = []
 
@@ -466,6 +600,7 @@ initialClientMetrics =
       0
       0
       False
+      False
 
 calculateBlockFetchClientMetrics ::
      ClientMetrics
@@ -473,64 +608,105 @@ calculateBlockFetchClientMetrics ::
   -> BlockFetch.TraceLabelPeer peer (BlockFetch.TraceFetchClientState header)
   -> IO ClientMetrics
 calculateBlockFetchClientMetrics cm@ClientMetrics {..} _lc
-            (TraceLabelPeer _ (BlockFetch.CompletedBlockFetch p _ _ _ forgeDelay blockSize)) =
-    case pointSlot p of
-            Origin -> pure cm {cmTraceIt = False}  -- Nothing to do.
-            At (SlotNo slotNo) -> do
-               if Pq.null cmSlotMap && forgeDelay > 20
-                  then pure cm {cmTraceIt = False} -- During startup wait until we are in sync
-                  else case Pq.lookup (fromIntegral slotNo) cmSlotMap of
-                        Just _ -> pure cm {cmTraceIt = False}  -- dupe, we only track the first
-                        Nothing -> do
-                          let slotMap' = Pq.insert (fromIntegral slotNo) slotNo forgeDelay cmSlotMap
-                          if Pq.size slotMap' > 1080 -- TODO k/2, should come from config file
-                            then case Pq.minView slotMap' of
-                                 Nothing -> pure cm {cmTraceIt = False} -- Err. We just inserted an element!
-                                 Just (_, minSlotNo, minDelay, slotMap'') ->
-                                   if minSlotNo == slotNo
-                                      then pure cm {cmTraceIt = False, cmSlotMap = slotMap'}
-                                      else let
-                                         cdf1sVar = decCdf minDelay cmCdf1sVar
-                                         cdf3sVar = decCdf minDelay cmCdf3sVar
-                                         cdf5sVar = decCdf minDelay cmCdf5sVar
-                                         cdf1sVar' = incCdf forgeDelay cdf1sVar
-                                         cdf3sVar' = incCdf forgeDelay cdf3sVar
-                                         cdf5sVar' = incCdf forgeDelay cdf5sVar
-                                         in pure cm {
-                                              cmCdf1sVar  = cdf1sVar'
-                                            , cmCdf3sVar  = cdf3sVar'
-                                            , cmCdf5sVar  = cdf5sVar'
-                                            , cmDelay     = realToFrac  forgeDelay
-                                            , cmBlockSize = getSizeInBytes blockSize
-                                            , cmTraceIt   = True
-                                            , cmSlotMap   = slotMap''}
-                            else let
-                               cdf1sVar' = incCdf forgeDelay cmCdf1sVar
-                               cdf3sVar' = incCdf forgeDelay cmCdf3sVar
-                               cdf5sVar' = incCdf forgeDelay cmCdf5sVar
-                                -- -- Wait until we have at least 45 samples before we start providing
-                                -- -- cdf estimates.
-                               in if Pq.size slotMap' >= 45
-                                    then pure cm {
-                                         cmCdf1sVar  = cdf1sVar'
-                                       , cmCdf3sVar  = cdf3sVar'
-                                       , cmCdf5sVar  = cdf5sVar'
-                                       , cmDelay     = realToFrac forgeDelay
-                                       , cmBlockSize = getSizeInBytes blockSize
-                                       , cmTraceIt   = True
-                                       , cmSlotMap   = slotMap'}
-                                   else pure cm {
-                                        cmCdf1sVar  = cdf1sVar'
-                                      , cmCdf3sVar  = cdf3sVar'
-                                      , cmCdf5sVar  = cdf5sVar'
-                                      , cmTraceIt   = False
-                                      , cmSlotMap   = slotMap'}
+    (TraceLabelPeer _ (BlockFetch.CompletedBlockFetch p _ _ _ forgeDelay blockSize)) =
+  case pointSlot p of
+    Origin -> pure cm {cmTraceIt = False}  -- Nothing to do for Origin
+    At (SlotNo slotNo) ->
+      if Pq.null cmSlotMap && forgeDelay > 20
+        then pure cm {cmTraceIt = False}  -- During startup wait until we are in sync
+        else processSlot slotNo
+  where
+    processSlot slotNo =
+      case Pq.lookup (fromIntegral slotNo) cmSlotMap of
+        Just _  -> pure cm {cmTraceIt = False}  -- Duplicate, only track the first
+        Nothing -> let slotMap' = Pq.insert (fromIntegral slotNo) slotNo forgeDelay cmSlotMap
+                   in if Pq.size slotMap' > 1080
+                        then trimSlotMap slotMap' slotNo
+                        else updateMetrics slotMap' slotNo
+
+    trimSlotMap slotMap' slotNo =
+      case Pq.minView slotMap' of
+        Nothing -> pure cm {cmTraceIt = False}  -- Error: Just inserted element
+        Just (_, minSlotNo, minDelay, slotMap'') ->
+          if minSlotNo == slotNo
+            then pure cm { cmTraceIt = False, cmSlotMap = slotMap' }
+            else let (cdf1sVar, cdf3sVar, cdf5sVar) = updateCDFs minDelay forgeDelay
+                 in pure cm
+                      { cmCdf1sVar  = cdf1sVar
+                      , cmCdf3sVar  = cdf3sVar
+                      , cmCdf5sVar  = cdf5sVar
+                      , cmDelay     = realToFrac forgeDelay
+                      , cmBlockSize = getSizeInBytes blockSize
+                      , cmTraceVars = True
+                      , cmTraceIt   = True
+                      , cmSlotMap   = slotMap'' }
+
+    updateMetrics slotMap' _slotNo =
+      let (cdf1sVar, cdf3sVar, cdf5sVar) = updateCDFs 0 forgeDelay
+      in if Pq.size slotMap' >= 45
+            then pure cm
+                 { cmCdf1sVar  = cdf1sVar
+                 , cmCdf3sVar  = cdf3sVar
+                 , cmCdf5sVar  = cdf5sVar
+                 , cmDelay     = realToFrac forgeDelay
+                 , cmBlockSize = getSizeInBytes blockSize
+                 , cmTraceVars = True
+                 , cmTraceIt   = True
+                 , cmSlotMap   = slotMap' }
+            else pure cm
+                 { cmCdf1sVar  = cdf1sVar
+                 , cmCdf3sVar  = cdf3sVar
+                 , cmCdf5sVar  = cdf5sVar
+                 , cmDelay     = realToFrac forgeDelay
+                 , cmBlockSize = getSizeInBytes blockSize
+                 , cmTraceVars = False
+                 , cmTraceIt   = True
+                 , cmSlotMap   = slotMap' }
+
+    updateCDFs minDelay forgeDelay' =
+      ( incCdf forgeDelay' (decCdf minDelay cmCdf1sVar)
+      , incCdf forgeDelay' (decCdf minDelay cmCdf3sVar)
+      , incCdf forgeDelay' (decCdf minDelay cmCdf5sVar) )
+
 
 calculateBlockFetchClientMetrics cm _lc _ = pure cm
+
 
 --------------------------------------------------------------------------------
 -- BlockFetchDecision Tracer
 --------------------------------------------------------------------------------
+
+instance MetaTrace (TraceDecisionEvent peer (Header blk)) where
+  namespaceFor PeersFetch{} = Namespace [] ["PeersFetch"]
+  namespaceFor PeerStarvedUs{} = Namespace [] ["PeerStarvedUs"]
+
+  severityFor (Namespace _ ["PeersFetch"]) _ = Just Debug
+  severityFor (Namespace _ ["PeerStarvedUs"]) _ = Just Info
+  severityFor _ _ = Nothing
+
+  documentFor (Namespace [] ["PeersFetch"]) =
+    Just "list of block-fetch decisions"
+  documentFor (Namespace [] ["PeerStarvedUs"]) =
+    Just "current peer starved us, the node will switch to a different peer"
+  documentFor _ = Nothing
+
+  allNamespaces =
+    [ Namespace [] ["PeersFetch"], Namespace [] ["PeerStarvedUs"] ]
+
+instance (Show peer, ToJSON peer, ConvertRawHash (Header blk), HasHeader blk)
+      => LogFormatting (TraceDecisionEvent peer (Header blk)) where
+  forHuman = Text.pack . show
+
+  forMachine dtal (PeersFetch xs) =
+    mconcat [ "kind" .= String "PeerFetch"
+            , "decisions" .= if dtal >= DMaximum
+                               then toJSON (Verbose <$> xs)
+                               else toJSON xs
+            ]
+  forMachine _dtal (PeerStarvedUs peer) =
+    mconcat [ "kind" .= String "PeerStarvedUs"
+            , "peer" .= toJSON peer
+            ]
 
 instance (LogFormatting peer, Show peer) =>
     LogFormatting [TraceLabelPeer peer (FetchDecision [Point header])] where
@@ -540,9 +716,9 @@ instance (LogFormatting peer, Show peer) =>
   forMachine _ xs       = mconcat
     [ "kind"  .= String "PeersFetch"
     , "peers" .= toJSON
-      (foldl' (\acc x -> forMachine DDetailed x : acc) [] xs) ]
+      (List.foldl' (\acc x -> forMachine DDetailed x : acc) [] xs) ]
 
-  asMetrics peers = [IntM "BlockFetch.ConnectedPeers" (fromIntegral (length peers))]
+  asMetrics peers = [IntM "connectedPeers" (fromIntegral (length peers))]
 
 instance MetaTrace [TraceLabelPeer peer (FetchDecision [Point header])] where
   namespaceFor (a : _tl) = (nsCast . namespaceFor) a
@@ -595,9 +771,9 @@ instance MetaTrace (FetchDecision [Point header]) where
     severityFor _ _ = Nothing
 
     metricsDocFor (Namespace _ ["Decline"]) =
-      [("Blockfetch.ConnectedPeers", "Number of connected peers")]
+      [("connectedPeers", "Number of connected peers")]
     metricsDocFor (Namespace _ ["Accept"]) =
-      [("Blockfetch.ConnectedPeers", "Number of connected peers")]
+      [("connectedPeers", "Number of connected peers")]
     metricsDocFor _ = []
 
     documentFor _ =  Just $ mconcat
@@ -625,13 +801,13 @@ instance (HasHeader header, ConvertRawHash header) =>
               , "head" .= String (renderChainHash
                                   (renderHeaderHash (Proxy @header))
                                   (AF.headHash af))
-              , "length" .= toJSON (fragmentLength af)]
+              , "length" .= toJSON (fragmentLength' af)]
         where
           -- NOTE: this ignores the Byron era with its EBB complication:
           -- the length would be underestimated by 1, if the AF is anchored
           -- at the epoch boundary.
-          fragmentLength :: AF.AnchoredFragment header -> Int
-          fragmentLength f = fromIntegral . unBlockNo $
+          fragmentLength' :: AF.AnchoredFragment header -> Int
+          fragmentLength' f = fromIntegral . unBlockNo $
               case (f, f) of
                 (AS.Empty{}, AS.Empty{}) -> 0
                 (firstHdr AS.:< _, _ AS.:> lastHdr) ->
@@ -739,7 +915,7 @@ instance ConvertRawHash blk => LogFormatting (TraceBlockFetchServerEvent blk) wh
                                     (renderHeaderHash (Proxy @blk))
                                     $ pointHash blk)]
   asMetrics (TraceBlockFetchServerSendBlock _p) =
-    [CounterM "BlockFetch.BlocksServed" Nothing]
+    [CounterM "served.block" Nothing]
 
 instance MetaTrace (TraceBlockFetchServerEvent blk) where
     namespaceFor TraceBlockFetchServerSendBlock {} =
@@ -750,7 +926,8 @@ instance MetaTrace (TraceBlockFetchServerEvent blk) where
     severityFor _ _ = Nothing
 
     metricsDocFor (Namespace [] ["SendBlock"]) =
-      [("Blockfetch.BlocksServed", "")]
+      [("served.block", "This counter metric indicates how many blocks this node has served.")
+      ,("served.block.latest", "This counter metric indicates how many chain tip blocks this node has served.")]
     metricsDocFor _ = []
 
     documentFor (Namespace [] ["SendBlock"]) = Just
@@ -758,6 +935,158 @@ instance MetaTrace (TraceBlockFetchServerEvent blk) where
     documentFor _ = Nothing
 
     allNamespaces = [Namespace [] ["SendBlock"]]
+
+--------------------------------------------------------------------------------
+-- Metric for server block latest
+-- Only traces to EKG, no complete tracer!
+--------------------------------------------------------------------------------
+
+data ServedBlock = ServedBlock {
+    maxSlotNo :: SlotNo
+  , localUp :: Word64
+  , servedBlocksLatest :: Word64
+}
+
+instance LogFormatting ServedBlock where
+  forMachine _mDtal ServedBlock {} = mempty
+
+  asMetrics ServedBlock {..} =
+    [IntM "served.block.latest" (fromIntegral servedBlocksLatest)]
+
+emptyServedBlocks :: ServedBlock
+emptyServedBlocks = ServedBlock 0 0 0
+
+servedBlockLatest ::
+     Maybe (Trace IO FormattedMessage)
+  -> IO (Trace IO  (TraceLabelPeer peer (TraceBlockFetchServerEvent blk)))
+servedBlockLatest mbTrEKG =
+      foldTraceM calculateServedBlockLatest emptyServedBlocks
+                  (metricsFormatter
+                    (mkMetricsTracer mbTrEKG))
+
+calculateServedBlockLatest :: (Monad m)
+                          =>ServedBlock
+                          -> LoggingContext
+                          -> TraceLabelPeer peer (TraceBlockFetchServerEvent blk)
+                          -> m ServedBlock
+calculateServedBlockLatest ServedBlock{..} _lc (TraceLabelPeer _ (TraceBlockFetchServerSendBlock p)) =
+    case pointSlot p of
+      Origin    -> return $ ServedBlock maxSlotNo localUp servedBlocksLatest
+      At slotNo ->
+          case compare maxSlotNo slotNo of
+              LT -> return $ ServedBlock slotNo (localUp + 1) (localUp + 1)
+              GT -> return $ ServedBlock maxSlotNo localUp servedBlocksLatest
+              EQ -> return $ ServedBlock maxSlotNo (localUp + 1) (localUp + 1)
+
+
+--------------------------------------------------------------------------------
+-- Gdd Tracer
+--------------------------------------------------------------------------------
+
+instance ( LogFormatting peer
+         , HasHeader blk
+         , HasHeader (Header blk)
+         , ConvertRawHash (Header blk)
+         ) => LogFormatting (TraceGDDEvent peer blk) where
+  forMachine dtal (TraceGDDDebug (GDDDebugInfo {..})) = mconcat $
+    [ "kind" .= String "TraceGDDDebugInfo"
+    , "losingPeers".= toJSON (map (forMachine dtal) losingPeers)
+    , "loeHead" .= forMachine dtal loeHead
+    , "sgen" .= toJSON (unGenesisWindow sgen)
+    ] <> do
+      guard $ dtal >= DMaximum
+      [ "bounds" .= toJSON (
+           map
+           ( \(peer, density) -> Aeson.object
+             [ "kind" .= String "PeerDensityBound"
+             , "peer" .= forMachine dtal peer
+             , "densityBounds" .= forMachine dtal density
+             ]
+           )
+           bounds
+         )
+       , "curChain" .= forMachine dtal curChain
+       , "candidates" .= toJSON (
+           map
+           ( \(peer, frag) -> Aeson.object
+             [ "kind" .= String "PeerCandidateFragment"
+             , "peer" .= forMachine dtal peer
+             , "candidateFragment" .= forMachine dtal frag
+             ]
+           )
+           candidates
+         )
+       , "candidateSuffixes" .= toJSON (
+           map
+           ( \(peer, frag) -> Aeson.object
+             [ "kind" .= String "PeerCandidateSuffix"
+             , "peer" .= forMachine dtal peer
+             , "candidateSuffix" .= forMachine dtal frag
+             ]
+           )
+           candidateSuffixes
+         )
+       ]
+
+  forMachine dtal (TraceGDDDisconnected peers) = mconcat
+    [ "kind" .= String "TraceGDDDisconnected"
+    , "peers" .= toJSON (map (forMachine dtal) (toList peers))
+    ]
+
+  forHuman = forHumanOrMachine
+
+instance MetaTrace (TraceGDDEvent peer blk) where
+  namespaceFor _ = Namespace [] ["TraceGDDEvent"]
+
+  severityFor _ _ = Just Debug
+
+  documentFor _ = Just "The Genesis Density Disconnection governor has updated its state"
+
+  allNamespaces = [Namespace [] ["TraceGDDEvent"]]
+
+instance ( HasHeader blk
+         , HasHeader (Header blk)
+         , ConvertRawHash (Header blk)
+         ) => LogFormatting (DensityBounds blk) where
+  forMachine dtal DensityBounds {..} = mconcat
+    [ "kind" .= String "DensityBounds"
+    , "clippedFragment" .= forMachine dtal clippedFragment
+    , "offersMoreThanK" .= toJSON offersMoreThanK
+    , "lowerBound" .= toJSON lowerBound
+    , "upperBound" .= toJSON upperBound
+    , "hasBlockAfter" .= toJSON hasBlockAfter
+    , "latestSlot" .= toJSON (unSlotNo <$> withOriginToMaybe latestSlot)
+    , "idling" .= toJSON idling
+    ]
+
+  forHuman = forHumanOrMachine
+
+
+--------------------------------------------------------------------------------
+-- SanityCheckIssue Tracer
+--------------------------------------------------------------------------------
+
+instance MetaTrace SanityCheckIssue where
+
+  namespaceFor InconsistentSecurityParam {} = Namespace [] ["SanityCheckIssue"]
+
+  severityFor (Namespace _ ["SanityCheckIssue"]) _ = Just Error
+  severityFor _ _ = Nothing
+
+  documentFor (Namespace _ ["SanityCheckIssue"]) = Nothing
+  documentFor _ = Nothing
+
+  allNamespaces = [Namespace [] ["SanityCheckIssue"]]
+
+instance LogFormatting SanityCheckIssue where
+  forMachine _dtal (InconsistentSecurityParam e) =
+    mconcat [ "kind" .= String "InconsistentSecurityParam"
+            , "error" .= String (Text.pack $ show e)
+            ]
+  forHuman (InconsistentSecurityParam e) =
+    "Configuration contains multiple security parameters: " <> Text.pack (show e)
+
+
 
 --------------------------------------------------------------------------------
 -- TxInbound Tracer
@@ -791,11 +1120,11 @@ instance LogFormatting (TraceTxSubmissionInbound txid tx) where
       ]
 
   asMetrics (TraceTxSubmissionCollected count)=
-    [CounterM "TxSubmission.Submitted" (Just count)]
+    [CounterM "submissions.submitted" (Just count)]
   asMetrics (TraceTxSubmissionProcessed processed) =
-    [ CounterM "TxSubmission.Accepted"
+    [ CounterM "submissions.accepted"
         (Just (ptxcAccepted processed))
-    , CounterM "TxSubmission.Rejected"
+    , CounterM "submissions.rejected"
         (Just (ptxcRejected processed))
     ]
   asMetrics _ = []
@@ -815,10 +1144,10 @@ instance MetaTrace (TraceTxSubmissionInbound txid tx) where
     severityFor _ _ = Nothing
 
     metricsDocFor (Namespace _ ["Collected"]) =
-      [ ("TxSubmission.Submitted", "")]
+      [ ("submissions.submitted", "")]
     metricsDocFor (Namespace _ ["Processed"]) =
-      [ ("TxSubmission.Accepted", "")
-      , ("TxSubmission.Rejected", "")
+      [ ("submissions.accepted", "")
+      , ("submissions.rejected", "")
       ]
     metricsDocFor _ = []
 
@@ -983,33 +1312,40 @@ instance
       , "mempoolSize" .= forMachine dtal mpSz
       ]
 
+  forMachine _dtal (TraceMempoolSynced et) =
+    mconcat
+      [ "kind" .= String "TraceMempoolSynced"
+      , "enclosingTime" .= et
+      ]
+
   asMetrics (TraceMempoolAddedTx _tx _mpSzBefore mpSz) =
-    [ IntM "Mempool.TxsInMempool" (fromIntegral $ msNumTxs mpSz)
-    , IntM "Mempool.MempoolBytes" (fromIntegral $ msNumBytes mpSz)
+    [ IntM "txsInMempool" (fromIntegral $ msNumTxs mpSz)
+    , IntM "mempoolBytes" (fromIntegral . unByteSize32 . msNumBytes $ mpSz)
     ]
   asMetrics (TraceMempoolRejectedTx _tx _txApplyErr mpSz) =
-    [ IntM "Mempool.TxsInMempool" (fromIntegral $ msNumTxs mpSz)
-    , IntM "Mempool.MempoolBytes" (fromIntegral $ msNumBytes mpSz)
+    [ IntM "txsInMempool" (fromIntegral $ msNumTxs mpSz)
+    , IntM "mempoolBytes" (fromIntegral . unByteSize32 . msNumBytes $ mpSz)
     ]
-  asMetrics (TraceMempoolRemoveTxs _txs mpSz) =
-    [ IntM "Mempool.TxsInMempool" (fromIntegral $ msNumTxs mpSz)
-    , IntM "Mempool.MempoolBytes" (fromIntegral $ msNumBytes mpSz)
+  asMetrics (TraceMempoolRemoveTxs txs mpSz) =
+    [ IntM "txsInMempool" (fromIntegral $ msNumTxs mpSz)
+    , IntM "mempoolBytes" (fromIntegral . unByteSize32 . msNumBytes $ mpSz)
+    , CounterM "txsProcessedNum" (Just (fromIntegral $ length txs))
     ]
-  asMetrics (TraceMempoolManuallyRemovedTxs [] _txs1 mpSz) =
-    [ IntM "Mempool.TxsInMempool" (fromIntegral $ msNumTxs mpSz)
-    , IntM "Mempool.MempoolBytes" (fromIntegral $ msNumBytes mpSz)
+  asMetrics (TraceMempoolManuallyRemovedTxs _txs _txs1 mpSz) =
+    [ IntM "txsInMempool" (fromIntegral $ msNumTxs mpSz)
+    , IntM "mempoolBytes" (fromIntegral . unByteSize32 . msNumBytes $ mpSz)
     ]
-  asMetrics (TraceMempoolManuallyRemovedTxs txs _txs1 mpSz) =
-    [ IntM "Mempool.TxsInMempool" (fromIntegral $ msNumTxs mpSz)
-    , IntM "Mempool.MempoolBytes" (fromIntegral $ msNumBytes mpSz)
-    , CounterM "Mempool.TxsProcessedNum" (Just (fromIntegral $ length txs))
+  asMetrics (TraceMempoolSynced (FallingEdgeWith duration)) =
+    [ IntM "txsSyncDuration" (round $ 1000 * duration)
     ]
+  asMetrics (TraceMempoolSynced RisingEdge) = []
+
 
 instance LogFormatting MempoolSize where
   forMachine _dtal MempoolSize{msNumTxs, msNumBytes} =
     mconcat
       [ "numTxs" .= msNumTxs
-      , "bytes" .= msNumBytes
+      , "bytes" .= unByteSize32 msNumBytes
       ]
 
 
@@ -1018,29 +1354,34 @@ instance MetaTrace (TraceEventMempool blk) where
     namespaceFor TraceMempoolRejectedTx {} = Namespace [] ["RejectedTx"]
     namespaceFor TraceMempoolRemoveTxs {} = Namespace [] ["RemoveTxs"]
     namespaceFor TraceMempoolManuallyRemovedTxs {} = Namespace [] ["ManuallyRemovedTxs"]
+    namespaceFor TraceMempoolSynced {} = Namespace [] ["Synced"]
 
     severityFor (Namespace _ ["AddedTx"]) _ = Just Info
     severityFor (Namespace _ ["RejectedTx"]) _ = Just Info
     severityFor (Namespace _ ["RemoveTxs"]) _ = Just Info
     severityFor (Namespace _ ["ManuallyRemovedTxs"]) _ = Just Info
+    severityFor (Namespace _ ["Synced"]) _ = Just Debug
     severityFor _ _ = Nothing
 
     metricsDocFor (Namespace _ ["AddedTx"]) =
-      [ ("Mempool.TxsInMempool","Transactions in mempool")
-      , ("Mempool.MempoolBytes", "Byte size of the mempool")
+      [ ("txsInMempool","Transactions in mempool")
+      , ("mempoolBytes", "Byte size of the mempool")
       ]
     metricsDocFor (Namespace _ ["RejectedTx"]) =
-      [ ("Mempool.TxsInMempool","Transactions in mempool")
-      , ("Mempool.MempoolBytes", "Byte size of the mempool")
+      [ ("txsInMempool","Transactions in mempool")
+      , ("mempoolBytes", "Byte size of the mempool")
       ]
     metricsDocFor (Namespace _ ["RemoveTxs"]) =
-      [ ("Mempool.TxsInMempool","Transactions in mempool")
-      , ("Mempool.MempoolBytes", "Byte size of the mempool")
+      [ ("txsInMempool","Transactions in mempool")
+      , ("mempoolBytes", "Byte size of the mempool")
       ]
     metricsDocFor (Namespace _ ["ManuallyRemovedTxs"]) =
-      [ ("Mempool.TxsInMempool","Transactions in mempool")
-      , ("Mempool.MempoolBytes", "Byte size of the mempool")
-      , ("Mempool.TxsProcessedNum", "")
+      [ ("txsInMempool","Transactions in mempool")
+      , ("mempoolBytes", "Byte size of the mempool")
+      , ("txsProcessedNum", "")
+      ]
+    metricsDocFor (Namespace _ ["Synced"]) =
+      [ ("txsSyncDuration", "Time to sync the mempool in ms after block adoption")
       ]
     metricsDocFor _ = []
 
@@ -1064,6 +1405,7 @@ instance MetaTrace (TraceEventMempool blk) where
       , Namespace [] ["RejectedTx"]
       , Namespace [] ["RemoveTxs"]
       , Namespace [] ["ManuallyRemovedTxs"]
+      , Namespace [] ["Synced"]
       ]
 
 --------------------------------------------------------------------------------
@@ -1081,8 +1423,8 @@ instance ( tx ~ GenTx blk
          , HasTxId (GenTx blk)
          , Show (ForgeStateUpdateError blk)
          , Show (CannotForge blk)
-         , LogFormatting (InvalidBlockReason blk)
          , LogFormatting (CannotForge blk)
+         , LogFormatting (ExtValidationError blk)
          , LogFormatting (ForgeStateUpdateError blk))
          => LogFormatting (ForgeTracerType blk) where
   forMachine dtal (Left i)  = forMachine dtal i
@@ -1123,8 +1465,8 @@ instance MetaTrace  (ForgeTracerType blk) where
   privacyFor _ _ = Nothing
 
   metricsDocFor (Namespace _ ["StartLeadershipCheckPlus"]) =
-      [ ("Forge.UtxoSize", "")
-      , ("Forge.DelegMapSize", "")
+      [ ("Forge.UtxoSize", "UTxO set size")
+      , ("Forge.DelegMapSize", "Delegation map size")
       ]
   metricsDocFor ns =
     metricsDocFor (nsCast ns :: Namespace (TraceForgeEvent blk))
@@ -1154,12 +1496,13 @@ instance LogFormatting TraceStartLeadershipCheckPlus where
                 ]
   forHuman TraceStartLeadershipCheckPlus {..} =
       "Checking for leadership in slot " <> showT (unSlotNo tsSlotNo)
-      <> " utxoSize " <> showT tsUtxoSize
+      <> " utxoSize "     <> showT tsUtxoSize
       <> " delegMapSize " <> showT tsDelegMapSize
       <> " chainDensity " <> showT tsChainDensity
   asMetrics TraceStartLeadershipCheckPlus {..} =
-    [IntM "Forge.UtxoSize" (fromIntegral tsUtxoSize),
-     IntM "Forge.DelegMapSize" (fromIntegral tsDelegMapSize)]
+    [IntM "utxoSize"     (fromIntegral tsUtxoSize),
+     IntM "delegMapSize" (fromIntegral tsDelegMapSize)]
+
 
 --------------------------------------------------------------------------------
 -- ForgeEvent Tracer
@@ -1177,8 +1520,8 @@ instance ( tx ~ GenTx blk
          , Show (ForgeStateUpdateError blk)
          , Show (CannotForge blk)
          , Show (TxId (GenTx blk))
-         , LogFormatting (InvalidBlockReason blk)
          , LogFormatting (CannotForge blk)
+         , LogFormatting (ExtValidationError blk)
          , LogFormatting (ForgeStateUpdateError blk))
       => LogFormatting (TraceForgeEvent blk) where
   forMachine _dtal (TraceStartLeadershipCheck slotNo) =
@@ -1397,54 +1740,51 @@ instance ( tx ~ GenTx blk
         Nothing -> []
         Just kesInfo ->
           [ IntM
-              "Forge.OperationalCertificateStartKESPeriod"
+              "operationalCertificateStartKESPeriod"
               (fromIntegral . unKESPeriod . HotKey.kesStartPeriod $ kesInfo)
           , IntM
-              "Forge.OperationalCertificateExpiryKESPeriod"
+              "operationalCertificateExpiryKESPeriod"
               (fromIntegral . unKESPeriod . HotKey.kesEndPeriod $ kesInfo)
           , IntM
-              "Forge.CurrentKESPeriod"
+              "currentKESPeriod"
               0
           , IntM
-              "Forge.RemainingKESPeriods"
+              "remainingKESPeriods"
               0
           ])
 
+
   asMetrics (TraceStartLeadershipCheck slot) =
-    [IntM "Forge.AboutToLeadSlotLast" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.about-to-lead" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceSlotIsImmutable slot _tipPoint _tipBlkNo) =
-    [IntM "Forge.SlotIsImmutable" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.slot-is-immutable" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceBlockFromFuture slot _slotNo) =
-    [IntM "Forge.BlockFromFuture" (fromIntegral $ unSlotNo slot)]
-  asMetrics (TraceBlockContext slot _tipBlkNo _tipPoint) =
-    [IntM "Forge.BlockContext" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.block-from-future" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceNoLedgerState slot _) =
-    [IntM "Forge.CouldNotForgeSlotLast" (fromIntegral $ unSlotNo slot)]
-  asMetrics (TraceLedgerState slot _) =
-    [IntM "Forge.LedgerState" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.could-not-forge" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceNoLedgerView slot _) =
-    [IntM "Forge.CouldNotForgeSlotLast" (fromIntegral $ unSlotNo slot)]
-  asMetrics (TraceLedgerView slot) =
-    [IntM "Forge.LedgerView" (fromIntegral $ unSlotNo slot)]
-  -- see above
+    [IntM "Forge.could-not-forge" (fromIntegral $ unSlotNo slot)]
+  asMetrics (TraceLedgerView _) = []
+  asMetrics TraceBlockContext {} = []
+  asMetrics (TraceLedgerState _ _) = []
   asMetrics (TraceNodeCannotForge slot _reason) =
-    [IntM "Forge.NodeCannotForge" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.could-not-forge" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceNodeNotLeader slot) =
-    [IntM "Forge.NodeNotLeader" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.node-not-leader" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceNodeIsLeader slot) =
-    [IntM "Forge.NodeIsLeader" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.node-is-leader" (fromIntegral $ unSlotNo slot)]
   asMetrics TraceForgeTickedLedgerState {} = []
   asMetrics TraceForgingMempoolSnapshot {} = []
   asMetrics (TraceForgedBlock slot _ _ _) =
-    [IntM "Forge.ForgedSlotLast" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.forged" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceDidntAdoptBlock slot _) =
-    [IntM "Forge.NotAdoptedSlotLast" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.didnt-adopt" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceForgedInvalidBlock slot _ _) =
-    [IntM "Forge.ForgedInvalidSlotLast" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.forged-invalid" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceAdoptedBlock slot _ _) =
-    [IntM "Forge.AdoptedOwnBlockSlotLast" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.adopted" (fromIntegral $ unSlotNo slot)]
   asMetrics (TraceAdoptionThreadDied slot _) =
-    [IntM "Forge.AdoptionThreadDied" (fromIntegral $ unSlotNo slot)]
+    [IntM "Forge.adoption-thread-died" (fromIntegral $ unSlotNo slot)]
 
 instance MetaTrace (TraceForgeEvent blk) where
   namespaceFor TraceStartLeadershipCheck {} =
@@ -1508,45 +1848,42 @@ instance MetaTrace (TraceForgeEvent blk) where
   severityFor _ _ = Nothing
 
   metricsDocFor (Namespace _ ["StartLeadershipCheck"]) =
-    [("Forge.AboutToLeadSlotLast", "")]
+    [("Forge.about-to-lead", "")]
   metricsDocFor (Namespace _ ["SlotIsImmutable"]) =
-    [("Forge.SlotIsImmutable", "")]
+    [("Forge.slot-is-immutable", "")]
   metricsDocFor (Namespace _ ["BlockFromFuture"]) =
-    [("Forge.BlockFromFuture", "")]
-  metricsDocFor (Namespace _ ["BlockContext"]) =
-    [("Forge.BlockContext", "")]
+    [("Forge.block-from-future", "")]
+  metricsDocFor (Namespace _ ["BlockContext"]) = []
   metricsDocFor (Namespace _ ["NoLedgerState"]) =
-    [("Forge.CouldNotForgeSlotLast", "")]
-  metricsDocFor (Namespace _ ["LedgerState"]) =
-    [("Forge.LedgerState", "")]
+    [("Forge.could-not-forge", "")]
+  metricsDocFor (Namespace _ ["LedgerState"]) = []
   metricsDocFor (Namespace _ ["NoLedgerView"]) =
-    [("Forge.CouldNotForgeSlotLast", "")]
-  metricsDocFor (Namespace _ ["LedgerView"]) =
-    [("Forge.LedgerView", "")]
+    [("Forge.could-not-forge", "")]
+  metricsDocFor (Namespace _ ["LedgerView"]) = []
   metricsDocFor (Namespace _ ["ForgeStateUpdateError"]) =
-    [ ("Forge.OperationalCertificateStartKESPeriod", "")
-    , ("Forge.OperationalCertificateExpiryKESPeriod", "")
-    , ("Forge.CurrentKESPeriod", "")
-    , ("Forge.RemainingKESPeriods", "")
+    [ ("operationalCertificateStartKESPeriod", "")
+    , ("operationalCertificateExpiryKESPeriod", "")
+    , ("currentKESPeriod", "")
+    , ("remainingKESPeriods", "")
     ]
   metricsDocFor (Namespace _ ["NodeCannotForge"]) =
-    [("Forge.NodeCannotForge", "")]
+    [("Forge.could-not-forge", "")]
   metricsDocFor (Namespace _ ["NodeNotLeader"]) =
-    [("Forge.NodeNotLeader", "")]
+    [("Forge.node-not-leader", "")]
   metricsDocFor (Namespace _ ["NodeIsLeader"]) =
-    [("Forge.NodeIsLeader", "")]
+    [("Forge.node-is-leader", "")]
   metricsDocFor (Namespace _ ["ForgeTickedLedgerState"]) = []
   metricsDocFor (Namespace _ ["ForgingMempoolSnapshot"]) = []
   metricsDocFor (Namespace _ ["ForgedBlock"]) =
-    [("Forge.ForgedSlotLast", "")]
+    [("Forge.forged", "")]
   metricsDocFor (Namespace _ ["DidntAdoptBlock"]) =
-    [("Forge.NotAdoptedSlotLast", "")]
+    [("Forge.didnt-adopt", "")]
   metricsDocFor (Namespace _ ["ForgedInvalidBlock"]) =
-    [("Forge.ForgedInvalidSlotLast", "")]
+    [("Forge.forged-invalid", "")]
   metricsDocFor (Namespace _ ["AdoptedBlock"]) =
-    [("Forge.AdoptedOwnBlockSlotLast", "")]
+    [("Forge.adopted", "")]
   metricsDocFor (Namespace _ ["AdoptionThreadDied"]) =
-    [("Forge.AdoptionThreadDied", "")]
+    [("Forge.adoption-thread-died", "")]
   metricsDocFor _ = []
 
   documentFor (Namespace _ ["StartLeadershipCheck"]) = Just
@@ -1900,6 +2237,48 @@ instance MetaTrace (TraceGsmEvent selection) where
     , Namespace [] ["GsmEventPreSyncingToSyncing"]
     , Namespace [] ["GsmEventSyncingToPreSyncing"]
     ]
+
+--------------------------------------------------------------------------------
+-- CSJ Tracer
+--------------------------------------------------------------------------------
+
+instance ( LogFormatting peer, Show peer
+         ) => LogFormatting (Jumping.TraceEvent peer) where
+  forMachine dtal =
+    \case
+      RotatedDynamo oldPeer newPeer ->
+        mconcat
+          [ "kind" .= String "RotatedDynamo"
+          , "oldPeer" .= forMachine dtal oldPeer
+          , "newPeer" .= forMachine dtal newPeer
+          ]
+
+  forHuman (RotatedDynamo fromPeer toPeer) =
+    "Rotated the dynamo from " <> showT fromPeer <> " to " <> showT toPeer
+
+instance MetaTrace (Jumping.TraceEvent peer) where
+  namespaceFor =
+    \case
+      RotatedDynamo {}        -> Namespace [] ["RotatedDynamo"]
+
+  severityFor ns _ =
+    case ns of
+      Namespace _ ["RotatedDynamo"]               -> Just Info
+      Namespace _ _                               -> Nothing
+
+  documentFor = \case
+    Namespace _ ["RotatedDynamo"] ->
+      Just "The ChainSync Jumping module has been asked to rotate its dynamo"
+    Namespace _ _ ->
+      Nothing
+
+  allNamespaces =
+    [ Namespace [] ["RotatedDynamo"]
+    ]
+
+--------------------------------------------------------------------------------
+-- Chain tip tracer
+--------------------------------------------------------------------------------
 
 instance ( StandardHash blk
          , ConvertRawHash blk

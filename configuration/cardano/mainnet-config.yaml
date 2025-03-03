@@ -8,11 +8,11 @@ AlonzoGenesisHash: 7e94a15f55d1e82d10f09203fa1d40f8eede58fd8066542cf6566008068ed
 ByronGenesisFile: mainnet-byron-genesis.json
 ByronGenesisHash: 5f20df933584822601f9e3f8c024eb5eb252fe8cefb24d1317dc3d432e940ebb
 ConwayGenesisFile: mainnet-conway-genesis.json
-ConwayGenesisHash: 49ef010ff0d13b090893a919bbc22022038a8b782faa0b1561a256b781672174
+ConwayGenesisHash: 15a199f895e461ec0ffc6dd4e4028af28a492ab4e806d39cb674c88f7643ef62
 ShelleyGenesisFile: mainnet-shelley-genesis.json
 ShelleyGenesisHash: 1a3be38bcbb7911969283716ad7aa550250226b76a61fc51cc9a9a35d9276d81
 
-EnableP2P: true
+EnableP2P: True
 
 ##### Core protocol parameters #####
 
@@ -32,6 +32,18 @@ LastKnownBlockVersion-Minor: 0
 LastKnownBlockVersion-Alt: 0
 MaxKnownMajorProtocolVersion: 2
 
+##### Network Configuration #####
+
+PeerSharing: True
+TargetNumberOfActivePeers: 20
+TargetNumberOfEstablishedPeers: 40
+TargetNumberOfKnownPeers: 150
+TargetNumberOfRootPeers: 60
+
+##### Version Information #####
+
+MinNodeVersion: 10.1.4
+
 ##### Logging configuration #####
 
 # Enable or disable logging overall
@@ -41,6 +53,9 @@ TurnOnLogging: True
 # These metrics are traced in the context name: 'cardano.node.metrics' and can
 # be directed to the logs or monitoring backends.
 TurnOnLogMetrics: True
+
+# Use legacy tracing
+UseTraceDispatcher: False
 
 # Global logging severity filter. Messages must have at least this severity to
 # pass. Typical values would be Warning, Notice, Info or Debug.
@@ -231,12 +246,6 @@ TraceTxOutbound: False
 
 # Trace TxSubmission protocol messages.
 TraceTxSubmissionProtocol: False
-
-
-TargetNumberOfActivePeers: 20
-TargetNumberOfEstablishedPeers: 50
-TargetNumberOfKnownPeers: 100
-TargetNumberOfRootPeers: 100
 
 ##### Fine grained logging control #####
 

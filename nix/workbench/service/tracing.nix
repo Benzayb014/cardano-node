@@ -13,6 +13,7 @@ let
   {
     UseTraceDispatcher   = true;
     TraceOptionResourceFrequency = 1000;
+    TraceOptionNodeName = nodeSpec.name;
 
   ## Please see the generated tracing configuration reference at:
   ##
@@ -44,9 +45,11 @@ let
       "ChainSync.Remote.Serialised".severity = "Notice";
       "ChainSync.ServerBlock".severity = "Notice";
       "ChainSync.ServerHeader".severity = "Debug";
+      "Consensus.GSM".severity = "Info";
       "Forge.Loop".severity = "Debug";
       "Forge.StateInfo".severity = "Debug";
       "Mempool".severity = "Debug";
+      "Mempool.Synced".severity = "Silence";
       "Net".severity = "Notice";
       "Net.AcceptPolicy".severity = "Debug";
       "Net.ConnectionManager.Local".severity = "Debug";
@@ -62,6 +65,7 @@ let
       "Net.Mux.Local".severity = "Notice";
       "Net.Mux.Remote".severity = "Notice";
       "Net.PeerSelection.Actions".severity = "Debug";
+      "Net.PeerSelection.Counters".detail = "DMinimal";
       "Net.PeerSelection.Counters".severity = "Debug";
       "Net.PeerSelection.Initiator".severity = "Notice";
       "Net.PeerSelection.Responder".severity = "Notice";
@@ -86,6 +90,22 @@ let
       "TxSubmission.Remote".severity = "Notice";
       "TxSubmission.TxInbound".severity = "Debug";
       "TxSubmission.TxOutbound".severity = "Notice";
+      "Version.NodeVersion".severity = "Info";
+
+      ## These messages are UTxO-HD specific. On a regular node, the tracing system might warn at startup about config incosistencies (as those tracers do not exist).
+      ## This warning is expected, and can be safely ignored.
+      ## Silencing the tracers below aims at having a comparable log line rates (msgs per second) on UTxO-HD and regular nodes.
+      "ChainDB.LedgerEvent.Forker".severity = "Silence";
+      "Mempool.AttemptAdd".severity = "Silence";
+      "Mempool.AttemptingSync".severity = "Silence";
+      "Mempool.LedgerFound".severity = "Silence";
+      "Mempool.LedgerNotFound".severity = "Silence";
+      "Mempool.SyncDone".severity = "Silence";
+      "Mempool.SyncNotNeeded".severity = "Silence";
+
+      ## enable this to investigate tx validation errors, e.g. fee to small for Plutus script txns
+      ## comes with too much overhead to be the default for benchmarks
+      # "Mempool.RejectedTx".detail = "DDetailed";
       };
   };
 
@@ -112,6 +132,11 @@ let
     TraceBlockFetchServer       = true;
     TraceChainSyncHeaderServer  = true;
     TraceChainSyncClient        = true;
+    TraceGsm                    = true;
+
+    ## needs to be explicit when new tracing is the node's default
+    UseTraceDispatcher          = false;
+
     options = {
       mapBackends = {
         "cardano.node.resources" = [ "KatipBK" ];

@@ -12,6 +12,7 @@ module Cardano.Node.Tracing.Consistency
   , checkNodeTraceConfiguration'
   ) where
 
+
 import           Cardano.Logging
 import           Cardano.Logging.Resources
 import           Cardano.Logging.Resources.Types ()
@@ -23,27 +24,33 @@ import           Cardano.Node.Tracing.Formatting ()
 import qualified Cardano.Node.Tracing.StateRep as SR
 import           Cardano.Node.Tracing.Tracers.BlockReplayProgress
 import           Cardano.Node.Tracing.Tracers.Consensus
+import           Cardano.Node.Tracing.Tracers.ConsensusStartupException
 import           Cardano.Node.Tracing.Tracers.Diffusion ()
 import           Cardano.Node.Tracing.Tracers.KESInfo ()
 import           Cardano.Node.Tracing.Tracers.NodeToClient ()
 import           Cardano.Node.Tracing.Tracers.NodeToNode ()
+import           Cardano.Node.Tracing.Tracers.NodeVersion (NodeVersionTrace)
 import           Cardano.Node.Tracing.Tracers.NonP2P ()
 import           Cardano.Node.Tracing.Tracers.P2P ()
 import           Cardano.Node.Tracing.Tracers.Peer
 import           Cardano.Node.Tracing.Tracers.Shutdown ()
 import           Cardano.Node.Tracing.Tracers.Startup ()
+import           Ouroboros.Consensus.Block.SupportsSanityCheck (SanityCheckIssue)
 import           Ouroboros.Consensus.BlockchainTime.WallClock.Types (RelativeTime)
 import           Ouroboros.Consensus.BlockchainTime.WallClock.Util (TraceBlockchainTimeEvent (..))
 import           Ouroboros.Consensus.Cardano.Block
+import           Ouroboros.Consensus.Genesis.Governor (TraceGDDEvent (..))
 import           Ouroboros.Consensus.Ledger.Query (Query)
 import           Ouroboros.Consensus.Ledger.SupportsMempool (ApplyTxErr, GenTxId)
 import           Ouroboros.Consensus.Mempool (TraceEventMempool (..))
 import           Ouroboros.Consensus.MiniProtocol.BlockFetch.Server
                    (TraceBlockFetchServerEvent (..))
 import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client (TraceChainSyncClientEvent)
+import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping as Jumping
 import           Ouroboros.Consensus.MiniProtocol.ChainSync.Server (TraceChainSyncServerEvent)
 import           Ouroboros.Consensus.MiniProtocol.LocalTxSubmission.Server
                    (TraceLocalTxSubmissionServerEvent (..))
+import           Ouroboros.Consensus.Node.GSM (TraceGsmEvent)
 import qualified Ouroboros.Consensus.Protocol.Ledger.HotKey as HotKey
 import qualified Ouroboros.Consensus.Storage.ChainDB as ChainDB
 import           Ouroboros.Network.Block (Point (..), SlotNo, Tip)
@@ -51,18 +58,17 @@ import qualified Ouroboros.Network.BlockFetch.ClientState as BlockFetch
 import           Ouroboros.Network.BlockFetch.Decision
 import           Ouroboros.Network.ConnectionHandler (ConnectionHandlerTrace (..))
 import           Ouroboros.Network.ConnectionId (ConnectionId)
-import           Ouroboros.Network.ConnectionManager.Types (ConnectionManagerTrace (..))
+import qualified Ouroboros.Network.ConnectionManager.Core as ConnectionManager
 import qualified Ouroboros.Network.ConnectionManager.Types as ConnectionManager
 import qualified Ouroboros.Network.Diffusion as Diffusion
 import           Ouroboros.Network.Driver.Simple (TraceSendRecv)
-import           Ouroboros.Network.InboundGovernor (InboundGovernorTrace)
 import qualified Ouroboros.Network.InboundGovernor as InboundGovernor
 import           Ouroboros.Network.KeepAlive (TraceKeepAliveClient (..))
 import qualified Ouroboros.Network.NodeToClient as NtC
 import           Ouroboros.Network.NodeToNode (ErrorPolicyTrace (..), RemoteAddress, WithAddr (..))
 import qualified Ouroboros.Network.NodeToNode as NtN
-import           Ouroboros.Network.PeerSelection.Governor (DebugPeerSelection (..),
-                   PeerSelectionCounters (..), TracePeerSelection (..))
+import           Ouroboros.Network.PeerSelection.Governor (ChurnCounters, DebugPeerSelection (..),
+                   PeerSelectionCounters, TracePeerSelection (..))
 import           Ouroboros.Network.PeerSelection.LedgerPeers (TraceLedgerPeers)
 import           Ouroboros.Network.PeerSelection.PeerStateActions (PeerSelectionActionsTrace (..))
 import           Ouroboros.Network.PeerSelection.RootPeersDNS.LocalRootPeers
@@ -77,7 +83,7 @@ import           Ouroboros.Network.Protocol.LocalStateQuery.Type (LocalStateQuer
 import qualified Ouroboros.Network.Protocol.LocalTxMonitor.Type as LTM
 import qualified Ouroboros.Network.Protocol.LocalTxSubmission.Type as LTS
 import           Ouroboros.Network.Protocol.TxSubmission2.Type (TxSubmission2)
-import           Ouroboros.Network.Server2 (ServerTrace (..))
+import qualified Ouroboros.Network.Server2 as Server (Trace (..))
 import           Ouroboros.Network.Snocket (LocalAddress (..))
 import           Ouroboros.Network.Subscription.Dns (DnsTrace (..), WithDomainName (..))
 import           Ouroboros.Network.Subscription.Worker (SubscriptionTrace (..))
@@ -86,7 +92,7 @@ import           Ouroboros.Network.TxSubmission.Outbound (TraceTxSubmissionOutbo
 
 import           Control.Exception (SomeException)
 import qualified Data.Text as T
-import           Network.Mux (MuxTrace (..), WithMuxBearer (..))
+import qualified Network.Mux as Mux
 import qualified Network.Socket as Socket
 
 
@@ -130,17 +136,20 @@ getAllNamespaces =
                         (allNamespaces :: [Namespace (StartupTrace blk)])
         shutdownNS = map (nsGetTuple . nsReplacePrefix ["Shutdown"])
                         (allNamespaces :: [Namespace ShutdownTrace])
+        nodeVersionNS = map (nsGetTuple . nsReplacePrefix ["Version"])
+                        (allNamespaces :: [Namespace NodeVersionTrace])
+
         chainDBNS = map (nsGetTuple . nsReplacePrefix ["ChainDB"])
                         (allNamespaces :: [Namespace (ChainDB.TraceEvent blk)])
         replayBlockNS = map (nsGetTuple . nsReplacePrefix ["ChainDB", "ReplayBlock"])
                         (allNamespaces :: [Namespace ReplayBlockStats])
 -- Consensus tracers
+
         chainSyncClientNS = map
                               (nsGetTuple . nsReplacePrefix  ["ChainSync", "Client"])
                               (allNamespaces :: [Namespace (BlockFetch.TraceLabelPeer
                                                            (ConnectionId RemoteAddress)
                                                            (TraceChainSyncClientEvent blk))])
-
         chainSyncServerHeaderNS = map (nsGetTuple . nsReplacePrefix ["ChainSync", "ServerHeader"])
                         (allNamespaces :: [Namespace (TraceChainSyncServerEvent blk)])
         chainSyncServerBlockNS = map (nsGetTuple . nsReplacePrefix ["ChainSync", "ServerBlock"])
@@ -153,7 +162,6 @@ getAllNamespaces =
                         (allNamespaces :: [Namespace (BlockFetch.TraceLabelPeer
                                                       remotePeer
                                                       (BlockFetch.TraceFetchClientState (Header blk)))])
-
         blockFetchServerNS = map (nsGetTuple . nsReplacePrefix ["BlockFetch", "Server"])
                     (allNamespaces :: [Namespace (TraceBlockFetchServerEvent blk)])
 
@@ -168,6 +176,8 @@ getAllNamespaces =
                         (allNamespaces :: [Namespace (BlockFetch.TraceLabelPeer
                   remotePeer
                   (TraceTxSubmissionOutbound (GenTxId blk) (GenTx blk)))])
+        consensusSanityCheckNS = map (nsGetTuple . nsReplacePrefix ["Consensus", "SanityCheck"])
+                        (allNamespaces :: [Namespace SanityCheckIssue])
         localTxSubmissionServerNS = map (nsGetTuple . nsReplacePrefix
                                             ["TxSubmission", "LocalServer"])
                         (allNamespaces :: [Namespace
@@ -179,6 +189,14 @@ getAllNamespaces =
 
         blockchainTimeNS = map (nsGetTuple . nsReplacePrefix  ["BlockchainTime"])
                         (allNamespaces :: [Namespace (TraceBlockchainTimeEvent RelativeTime)])
+        gddNS = map (nsGetTuple . nsReplacePrefix  ["Consensus", "GDD"])
+                        (allNamespaces :: [Namespace (TraceGDDEvent peer blk)])
+        consensusStartupErrorNS = map (nsGetTuple . nsReplacePrefix  ["Consensus", "Startup"])
+                        (allNamespaces :: [Namespace ConsensusStartupException])
+        gsmNS = map (nsGetTuple . nsReplacePrefix  ["Consensus", "GSM"])
+                        (allNamespaces :: [Namespace (TraceGsmEvent (Tip blk))])
+        csjNS = map (nsGetTuple . nsReplacePrefix  ["Consensus", "CSJ"])
+                        (allNamespaces :: [Namespace (Jumping.TraceEvent peer)])
 
 -- Node to client
         keepAliveClientNS = map (nsGetTuple . nsReplacePrefix ["Net"])
@@ -239,10 +257,10 @@ getAllNamespaces =
 
         dtMuxNS = map (nsGetTuple . nsReplacePrefix ["Net", "Mux", "Remote"])
                              (allNamespaces :: [Namespace
-                                 (WithMuxBearer (ConnectionId RemoteAddress) MuxTrace)])
+                                 (Mux.WithBearer (ConnectionId RemoteAddress) Mux.Trace)])
         dtLocalMuxNS = map (nsGetTuple . nsReplacePrefix ["Net", "Mux", "Local"])
                              (allNamespaces :: [Namespace
-                                 (WithMuxBearer (ConnectionId LocalAddress) MuxTrace)])
+                                 (Mux.WithBearer (ConnectionId LocalAddress) Mux.Trace)])
         dtHandshakeNS = map (nsGetTuple . nsReplacePrefix
                                 ["Net", "Handshake", "Remote"])
                             (allNamespaces :: [Namespace
@@ -286,7 +304,9 @@ getAllNamespaces =
                                         ["Net", "PeerSelection", "Counters"])
                                       (allNamespaces :: [Namespace
                                         PeerSelectionCounters])
-
+        churnCountersNS = map (nsGetTuple . nsReplacePrefix
+                                  ["Net", "Churn"])
+                                (allNamespaces :: [Namespace ChurnCounters])
         peerSelectionActionsNS = map (nsGetTuple . nsReplacePrefix
                                   ["Net", "PeerSelection", "Actions"])
                                (allNamespaces :: [Namespace
@@ -294,7 +314,7 @@ getAllNamespaces =
         connectionManagerNS = map (nsGetTuple . nsReplacePrefix
                                     ["Net", "ConnectionManager", "Remote"])
                                   (allNamespaces :: [Namespace
-                                    (ConnectionManagerTrace
+                                    (ConnectionManager.Trace
                                     Socket.SockAddr
                                       (ConnectionHandlerTrace
                                         UnversionedProtocol
@@ -306,11 +326,11 @@ getAllNamespaces =
                                                 Socket.SockAddr)])
         serverNS = map (nsGetTuple . nsReplacePrefix
                          ["Net", "Server", "Remote"])
-                       (allNamespaces :: [Namespace (ServerTrace Socket.SockAddr)])
+                       (allNamespaces :: [Namespace (Server.Trace Socket.SockAddr)])
         inboundGovernorNS = map (nsGetTuple . nsReplacePrefix
                                   ["Net", "InboundGovernor", "Remote"])
                                 (allNamespaces :: [Namespace
-                                  (InboundGovernorTrace Socket.SockAddr)])
+                                  (InboundGovernor.Trace Socket.SockAddr)])
         inboundGovernorTransitionsNS = map (nsGetTuple . nsReplacePrefix
                                       ["Net", "InboundGovernor", "Transition"])
                                            (allNamespaces :: [Namespace
@@ -318,7 +338,7 @@ getAllNamespaces =
         localConnectionManagerNS = map (nsGetTuple . nsReplacePrefix
                                          ["Net", "ConnectionManager", "Local"])
                                        (allNamespaces :: [Namespace
-                                       (ConnectionManagerTrace
+                                       (ConnectionManager.Trace
                                           Socket.SockAddr
                                           (ConnectionHandlerTrace
                                             UnversionedProtocol
@@ -326,11 +346,11 @@ getAllNamespaces =
         localServerNS = map (nsGetTuple . nsReplacePrefix
                               ["Net", "Server", "Local"])
                             (allNamespaces :: [Namespace
-                              (ServerTrace LocalAddress)])
+                              (Server.Trace LocalAddress)])
         localInboundGovernorNS = map (nsGetTuple . nsReplacePrefix
                                         ["Net", "InboundGovernor", "Local"])
                                      (allNamespaces :: [Namespace
-                                        (InboundGovernorTrace LocalAddress)])
+                                        (InboundGovernor.Trace LocalAddress)])
 
 
 -- -- DiffusionTracersExtra nonP2P
@@ -366,6 +386,7 @@ getAllNamespaces =
             <> resourcesNS
             <> startupNS
             <> shutdownNS
+            <> nodeVersionNS
             <> chainDBNS
             <> replayBlockNS
 -- Consensus
@@ -373,6 +394,7 @@ getAllNamespaces =
             <> chainSyncServerHeaderNS
             <> chainSyncServerBlockNS
             <> blockFetchDecisionNS
+            <> consensusSanityCheckNS
             <> blockFetchClientNS
             <> blockFetchServerNS
             <> forgeKESInfoNS
@@ -382,6 +404,10 @@ getAllNamespaces =
             <> mempoolNS
             <> forgeNS
             <> blockchainTimeNS
+            <> gddNS
+            <> consensusStartupErrorNS
+            <> gsmNS
+            <> csjNS
 -- NodeToClient
             <> keepAliveClientNS
             <> chainSyncNS
@@ -409,6 +435,7 @@ getAllNamespaces =
             <> debugPeerSelectionNS
             <> debugPeerSelectionResponderNS
             <> peerSelectionCountersNS
+            <> churnCountersNS
             <> peerSelectionActionsNS
             <> connectionManagerNS
             <> connectionManagerTransitionsNS

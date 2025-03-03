@@ -33,6 +33,7 @@ import           Ouroboros.Network.NodeToNode (RemoteAddress)
 
 import           Prelude
 
+import           Control.DeepSeq (deepseq)
 import           "contra-tracer" Control.Tracer (traceWith)
 import           "trace-dispatcher" Control.Tracer (nullTracer)
 import           Data.Bifunctor (first)
@@ -61,7 +62,15 @@ initTraceDispatcher nc p networkMagic nodeKernel p2pMode = do
                 (unConfigPath $ ncConfigFile nc)
                 defaultCardanoConfig
 
-  tracers <- mkTracers trConfig
+  (kickoffForwarder, tracers) <- mkTracers trConfig
+
+  -- The NodeInfo DataPoint needs to be fully evaluated and stored
+  -- before it is queried for the first time by cardano-tracer.
+  -- Hence, we delay initiating the forwarding connection.
+  nodeInfo <- prepareNodeInfo nc p trConfig =<< getCurrentTime
+  nodeInfo `deepseq` traceWith (nodeInfoTracer tracers) nodeInfo
+
+  kickoffForwarder
 
   traceWith (nodeStateTracer tracers) NodeTracingOnlineConfiguring
 
@@ -74,35 +83,33 @@ initTraceDispatcher nc p networkMagic nodeKernel p2pMode = do
     nodeKernel
     (fromMaybe 2000 (tcPeerFrequency trConfig))
 
-  now <- getCurrentTime
-  prepareNodeInfo nc p trConfig now >>= traceWith (nodeInfoTracer tracers)
 
   pure tracers
  where
   mkTracers trConfig = do
     ekgStore <- EKG.newStore
     EKG.registerGcMetrics ekgStore
-    ekgTrace <- ekgTracer (Left ekgStore)
+    ekgTrace <- ekgTracer trConfig (Left ekgStore)
 
     stdoutTrace <- standardTracer
 
     -- We should initialize forwarding only if 'Forwarder' backend
     -- is presented in the node's configuration.
-    (fwdTracer, dpTracer) <-
+    (fwdTracer, dpTracer, kickoffForwarder) <-
       if forwarderBackendEnabled
         then do
           -- TODO: check if this is the correct way to use withIOManager
-          (forwardSink, dpStore) <- withIOManager $ \iomgr -> do
+          (forwardSink, dpStore, kickoffForwarder) <- withIOManager $ \iomgr -> do
             let tracerSocketMode = Just . first unFile =<< ncTraceForwardSocket nc
                 forwardingConf = fromMaybe defaultForwarder (tcForwarder trConfig)
-            initForwarding iomgr forwardingConf networkMagic (Just ekgStore) tracerSocketMode
-          pure (forwardTracer forwardSink, dataPointTracer dpStore)
+            initForwardingDelayed iomgr forwardingConf networkMagic (Just ekgStore) tracerSocketMode
+          pure (forwardTracer forwardSink, dataPointTracer dpStore, kickoffForwarder)
         else
           -- Since 'Forwarder' backend isn't enabled, there is no forwarding.
           -- So we use nullTracers to ignore 'TraceObject's and 'DataPoint's.
-          pure (Trace nullTracer, Trace nullTracer)
+          pure (Trace nullTracer, Trace nullTracer, pure ())
 
-    mkDispatchTracers
+    (,) kickoffForwarder <$> mkDispatchTracers
       nodeKernel
       stdoutTrace
       fwdTracer
@@ -111,9 +118,10 @@ initTraceDispatcher nc p networkMagic nodeKernel p2pMode = do
       trConfig
       p2pMode
       p
+
    where
     forwarderBackendEnabled =
-      any checkForwarder . concat . Map.elems $ tcOptions trConfig
+      (any (any checkForwarder) . Map.elems) $ tcOptions trConfig
 
     checkForwarder (ConfBackend backends') = Forwarder `elem` backends'
     checkForwarder _ = False

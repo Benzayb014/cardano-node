@@ -18,7 +18,8 @@ module Cardano.Node.Tracing.Documentation
   , docTracersFirstPhase
   ) where
 
-import           Cardano.Logging
+
+import           Cardano.Logging as Logging
 import           Cardano.Logging.Resources
 import           Cardano.Logging.Resources.Types ()
 import           Cardano.Node.Handlers.Shutdown (ShutdownTrace)
@@ -30,28 +31,34 @@ import qualified Cardano.Node.Tracing.StateRep as SR
 import           Cardano.Node.Tracing.Tracers.BlockReplayProgress
 import           Cardano.Node.Tracing.Tracers.ChainDB
 import           Cardano.Node.Tracing.Tracers.Consensus
+import           Cardano.Node.Tracing.Tracers.ConsensusStartupException
 import           Cardano.Node.Tracing.Tracers.Diffusion ()
 import           Cardano.Node.Tracing.Tracers.ForgingThreadStats (ForgeThreadStats)
 import           Cardano.Node.Tracing.Tracers.KESInfo ()
 import           Cardano.Node.Tracing.Tracers.NodeToClient ()
 import           Cardano.Node.Tracing.Tracers.NodeToNode ()
+import           Cardano.Node.Tracing.Tracers.NodeVersion (NodeVersionTrace)
 import           Cardano.Node.Tracing.Tracers.NonP2P ()
 import           Cardano.Node.Tracing.Tracers.P2P ()
 import           Cardano.Node.Tracing.Tracers.Peer
 import           Cardano.Node.Tracing.Tracers.Shutdown ()
 import           Cardano.Node.Tracing.Tracers.Startup ()
+import           Ouroboros.Consensus.Block.SupportsSanityCheck (SanityCheckIssue)
 import           Ouroboros.Consensus.BlockchainTime.WallClock.Types (RelativeTime)
 import           Ouroboros.Consensus.BlockchainTime.WallClock.Util (TraceBlockchainTimeEvent (..))
 import           Ouroboros.Consensus.Cardano.Block
+import           Ouroboros.Consensus.Genesis.Governor (TraceGDDEvent (..))
 import           Ouroboros.Consensus.Ledger.Query (Query)
 import           Ouroboros.Consensus.Ledger.SupportsMempool (ApplyTxErr, GenTxId)
 import           Ouroboros.Consensus.Mempool (TraceEventMempool (..))
 import           Ouroboros.Consensus.MiniProtocol.BlockFetch.Server
                    (TraceBlockFetchServerEvent (..))
 import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client (TraceChainSyncClientEvent)
+import           Ouroboros.Consensus.MiniProtocol.ChainSync.Client.Jumping as Jumping
 import           Ouroboros.Consensus.MiniProtocol.ChainSync.Server (TraceChainSyncServerEvent)
 import           Ouroboros.Consensus.MiniProtocol.LocalTxSubmission.Server
                    (TraceLocalTxSubmissionServerEvent (..))
+import           Ouroboros.Consensus.Node.GSM (TraceGsmEvent)
 import qualified Ouroboros.Consensus.Node.Tracers as Consensus
 import qualified Ouroboros.Consensus.Protocol.Ledger.HotKey as HotKey
 import qualified Ouroboros.Consensus.Storage.ChainDB as ChainDB
@@ -60,18 +67,17 @@ import qualified Ouroboros.Network.BlockFetch.ClientState as BlockFetch
 import           Ouroboros.Network.BlockFetch.Decision
 import           Ouroboros.Network.ConnectionHandler (ConnectionHandlerTrace (..))
 import           Ouroboros.Network.ConnectionId (ConnectionId)
-import           Ouroboros.Network.ConnectionManager.Types (ConnectionManagerTrace (..))
+import qualified Ouroboros.Network.ConnectionManager.Core as ConnectionManager
 import qualified Ouroboros.Network.ConnectionManager.Types as ConnectionManager
 import qualified Ouroboros.Network.Diffusion as Diffusion
 import           Ouroboros.Network.Driver.Simple (TraceSendRecv)
-import           Ouroboros.Network.InboundGovernor (InboundGovernorTrace)
 import qualified Ouroboros.Network.InboundGovernor as InboundGovernor
 import           Ouroboros.Network.KeepAlive (TraceKeepAliveClient (..))
 import qualified Ouroboros.Network.NodeToClient as NtC
 import           Ouroboros.Network.NodeToNode (ErrorPolicyTrace (..), RemoteAddress, WithAddr (..))
 import qualified Ouroboros.Network.NodeToNode as NtN
-import           Ouroboros.Network.PeerSelection.Governor (DebugPeerSelection (..),
-                   PeerSelectionCounters (..), TracePeerSelection (..))
+import           Ouroboros.Network.PeerSelection.Governor (ChurnCounters, DebugPeerSelection (..),
+                   PeerSelectionCounters, TracePeerSelection (..))
 import           Ouroboros.Network.PeerSelection.LedgerPeers (TraceLedgerPeers)
 import           Ouroboros.Network.PeerSelection.PeerStateActions (PeerSelectionActionsTrace (..))
 import           Ouroboros.Network.PeerSelection.RootPeersDNS.LocalRootPeers
@@ -86,7 +92,7 @@ import           Ouroboros.Network.Protocol.LocalStateQuery.Type (LocalStateQuer
 import qualified Ouroboros.Network.Protocol.LocalTxMonitor.Type as LTM
 import qualified Ouroboros.Network.Protocol.LocalTxSubmission.Type as LTS
 import           Ouroboros.Network.Protocol.TxSubmission2.Type (TxSubmission2)
-import           Ouroboros.Network.Server2 (ServerTrace (..))
+import qualified Ouroboros.Network.Server2 as Server (Trace (..))
 import           Ouroboros.Network.Snocket (LocalAddress (..))
 import           Ouroboros.Network.Subscription.Dns (DnsTrace (..), WithDomainName (..))
 import           Ouroboros.Network.Subscription.Ip (WithIPList (..))
@@ -95,18 +101,22 @@ import           Ouroboros.Network.TxSubmission.Inbound (TraceTxSubmissionInboun
 import           Ouroboros.Network.TxSubmission.Outbound (TraceTxSubmissionOutbound)
 
 import           Control.Exception (SomeException)
+import           Control.Monad (forM_)
 import           Data.Aeson.Types (ToJSON)
 import           Data.Proxy (Proxy (..))
 import qualified Data.Text.IO as T
 import           GHC.Generics (Generic)
-import           Network.Mux (MuxTrace (..), WithMuxBearer (..))
+import qualified Network.Mux as Mux
 import qualified Network.Socket as Socket
 import qualified Options.Applicative as Opt
+import           System.IO
+
 
 data TraceDocumentationCmd
   = TraceDocumentationCmd
     { tdcConfigFile :: FilePath
     , tdcOutput     :: FilePath
+    , tdMetricsHelp :: Maybe FilePath
     }
 
 parseTraceDocumentationCmd :: Opt.Parser TraceDocumentationCmd
@@ -121,14 +131,20 @@ parseTraceDocumentationCmd =
          (TraceDocumentationCmd
            <$> Opt.strOption
                ( Opt.long "config"
-                 <> Opt.metavar "NODE-CONFIGURATION"
+                 <> Opt.metavar "FILE"
                  <> Opt.help "Configuration file for the cardano-node"
                )
            <*> Opt.strOption
                ( Opt.long "output-file"
                  <> Opt.metavar "FILE"
-                 <> Opt.help "Generated documentation output file"
+                 <> Opt.help "Generated documentation output file (Markdown)"
                )
+           <*> Opt.optional (Opt.strOption
+                ( Opt.long "output-metric-help"
+                  <> Opt.metavar "FILE"
+                  <> Opt.help "Metrics helptext file for cardano-tracer (JSON)"
+                )
+              )
            Opt.<**> Opt.helper)
        $ mconcat [ Opt.progDesc "Generate the trace documentation" ]
      ]
@@ -144,7 +160,7 @@ runTraceDocumentationCmd
   :: TraceDocumentationCmd
   -> IO ()
 runTraceDocumentationCmd TraceDocumentationCmd{..} = do
-  docTracers tdcConfigFile tdcOutput
+  docTracers tdcConfigFile tdcOutput tdMetricsHelp
 
 -- Have to repeat the construction of the tracers here,
 -- as the tracers are behind old tracer interface after construction in mkDispatchTracers.
@@ -152,10 +168,11 @@ runTraceDocumentationCmd TraceDocumentationCmd{..} = do
 docTracers ::
      FilePath
   -> FilePath
+  -> Maybe FilePath
   -> IO ()
-docTracers configFileName outputFileName = do
+docTracers configFileName outputFileName mbMetricsHelpFilename = do
     (bl, trConfig) <- docTracersFirstPhase (Just configFileName)
-    docTracersSecondPhase outputFileName trConfig bl
+    docTracersSecondPhase outputFileName mbMetricsHelpFilename trConfig bl
 
 
 -- Have to repeat the construction of the tracers here,
@@ -173,10 +190,10 @@ docTracersFirstPhase condConfigFileName = do
     trConfig      <- case condConfigFileName of
                         Just fn -> readConfigurationWithDefault fn defaultCardanoConfig
                         Nothing -> pure defaultCardanoConfig
-    let trBase    :: Trace IO FormattedMessage = docTracer (Stdout MachineFormat)
-        trForward :: Trace IO FormattedMessage = docTracer Forwarder
+    let trBase    :: Logging.Trace IO FormattedMessage = docTracer (Stdout MachineFormat)
+        trForward :: Logging.Trace IO FormattedMessage = docTracer Forwarder
         trDataPoint = docTracerDatapoint DatapointBackend
-        mbTrEKG   :: Maybe (Trace IO FormattedMessage) = Just (docTracer EKGBackend)
+        mbTrEKG   :: Maybe (Logging.Trace IO FormattedMessage) = Just (docTracer EKGBackend)
 
     configReflection <- emptyConfigReflection
 
@@ -184,47 +201,53 @@ docTracersFirstPhase condConfigFileName = do
     nodeInfoDp <- mkDataPointTracer
                     trDataPoint
     configureTracers configReflection trConfig  [nodeInfoDp]
-    nodeInfoDpDoc <- documentTracer (nodeInfoDp :: Trace IO NodeInfo)
+    nodeInfoDpDoc <- documentTracer (nodeInfoDp :: Logging.Trace IO NodeInfo)
 
     nodeStartupInfoDp <- mkDataPointTracer
                 trDataPoint
     configureTracers configReflection trConfig [nodeStartupInfoDp]
     nodeStartupInfoDpDoc <- documentTracer
-                      (nodeStartupInfoDp :: Trace IO NodeStartupInfo)
+                      (nodeStartupInfoDp :: Logging.Trace IO NodeStartupInfo)
+
+    nodeVersionTr <- mkCardanoTracer
+                      trBase trForward mbTrEKG
+                      ["Version"]
+    configureTracers configReflection trConfig  [nodeVersionTr]
+    nodeVersionDoc <- documentTracer (nodeVersionTr :: Logging.Trace IO NodeVersionTrace)
 
     -- State tracer
     stateTr   <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["NodeState"]
     configureTracers configReflection trConfig [stateTr]
-    stateTrDoc <- documentTracer (stateTr :: Trace IO SR.NodeState)
+    stateTrDoc <- documentTracer (stateTr :: Logging.Trace IO SR.NodeState)
 
     --  Peers tracer
     peersTr   <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "Peers", "List"]
     configureTracers configReflection trConfig [peersTr]
-    peersTrDoc <- documentTracer (peersTr :: Trace IO  [PeerT blk])
+    peersTrDoc <- documentTracer (peersTr :: Logging.Trace IO  [PeerT blk])
 
     -- Resource tracer
     resourcesTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 []
     configureTracers configReflection trConfig [resourcesTr]
-    resourcesTrDoc <- documentTracer (resourcesTr :: Trace IO ResourceStats)
+    resourcesTrDoc <- documentTracer (resourcesTr :: Logging.Trace IO ResourceStats)
 
     -- Startup tracer
     startupTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Startup"]
     configureTracers configReflection trConfig [startupTr]
-    startupTrDoc <- documentTracer (startupTr :: Trace IO (StartupTrace blk))
+    startupTrDoc <- documentTracer (startupTr :: Logging.Trace IO (StartupTrace blk))
 
     shutdownTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Shutdown"]
     configureTracers configReflection trConfig  [shutdownTr]
-    shutdownTrDoc <- documentTracer (shutdownTr :: Trace IO ShutdownTrace)
+    shutdownTrDoc <- documentTracer (shutdownTr :: Logging.Trace IO ShutdownTrace)
 
     chainDBTr <- mkCardanoTracer'
                 trBase trForward mbTrEKG
@@ -232,13 +255,13 @@ docTracersFirstPhase condConfigFileName = do
                 withAddedToCurrentChainEmptyLimited
     configureTracers configReflection trConfig [chainDBTr]
     chainDBTrDoc <- documentTracer (chainDBTr ::
-                      Trace IO (ChainDB.TraceEvent blk))
+                      Logging.Trace IO (ChainDB.TraceEvent blk))
 
     replayBlockTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["ChainDB", "ReplayBlock"]
     configureTracers configReflection trConfig [replayBlockTr]
-    replayBlockTrDoc <- documentTracer (replayBlockTr :: Trace IO ReplayBlockStats)
+    replayBlockTrDoc <- documentTracer (replayBlockTr :: Logging.Trace IO ReplayBlockStats)
 
 -- Consensus tracers
 
@@ -247,7 +270,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["ChainSync", "Client"]
     configureTracers configReflection trConfig [chainSyncClientTr]
     chainSyncClientTrDoc <- documentTracer (chainSyncClientTr ::
-      (Trace IO (BlockFetch.TraceLabelPeer
+      (Logging.Trace IO (BlockFetch.TraceLabelPeer
                   (ConnectionId RemoteAddress)
                   (TraceChainSyncClientEvent blk))))
 
@@ -256,21 +279,21 @@ docTracersFirstPhase condConfigFileName = do
                 ["ChainSync", "ServerHeader"]
     configureTracers configReflection trConfig [chainSyncServerHeaderTr]
     chainSyncServerHeaderTrDoc <- documentTracer (chainSyncServerHeaderTr ::
-      (Trace IO (TraceChainSyncServerEvent blk)))
+      (Logging.Trace IO (TraceChainSyncServerEvent blk)))
 
     chainSyncServerBlockTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["ChainSync", "ServerBlock"]
     configureTracers configReflection trConfig [chainSyncServerBlockTr]
     chainSyncServerBlockTrDoc <- documentTracer (chainSyncServerBlockTr ::
-      (Trace IO (TraceChainSyncServerEvent blk)))
+      (Logging.Trace IO (TraceChainSyncServerEvent blk)))
 
     blockFetchDecisionTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["BlockFetch", "Decision"]
     configureTracers configReflection trConfig [blockFetchDecisionTr]
     blockFetchDecisionTrDoc <- documentTracer (blockFetchDecisionTr ::
-       Trace IO [BlockFetch.TraceLabelPeer
+       Logging.Trace IO [BlockFetch.TraceLabelPeer
                                       remotePeer
                                       (FetchDecision [Point (Header blk)])])
 
@@ -279,7 +302,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["BlockFetch", "Client"]
     configureTracers configReflection trConfig [blockFetchClientTr]
     blockFetchClientTrDoc <- documentTracer (blockFetchClientTr ::
-      Trace IO (BlockFetch.TraceLabelPeer
+      Logging.Trace IO (BlockFetch.TraceLabelPeer
                   remotePeer
                   (BlockFetch.TraceFetchClientState (Header blk))))
 
@@ -289,28 +312,28 @@ docTracersFirstPhase condConfigFileName = do
 
     configureTracers configReflection trConfig [blockFetchClientMetricsTr]
     blockFetchClientMetricsDoc <- documentTracer (blockFetchClientMetricsTr ::
-        Trace IO ClientMetrics)
+        Logging.Trace IO ClientMetrics)
 
     blockFetchServerTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["BlockFetch", "Server"]
     configureTracers configReflection trConfig [blockFetchServerTr]
     blockFetchServerTrDoc <- documentTracer (blockFetchServerTr ::
-      Trace IO (TraceBlockFetchServerEvent blk))
+      Logging.Trace IO (TraceBlockFetchServerEvent blk))
 
     forgeKESInfoTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Forge"]
     configureTracers configReflection trConfig [forgeKESInfoTr]
     forgeKESInfoTrDoc <- documentTracer (forgeKESInfoTr ::
-      Trace IO (Consensus.TraceLabelCreds HotKey.KESInfo))
+      Logging.Trace IO (Consensus.TraceLabelCreds HotKey.KESInfo))
 
     txInboundTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["TxSubmission", "TxInbound"]
     configureTracers configReflection trConfig [txInboundTr]
     txInboundTrDoc <- documentTracer (txInboundTr ::
-      Trace IO (BlockFetch.TraceLabelPeer
+      Logging.Trace IO (BlockFetch.TraceLabelPeer
                   remotePeer
                   (TraceTxSubmissionInbound (GenTxId blk) (GenTx blk))))
 
@@ -319,7 +342,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["TxSubmission", "TxOutbound"]
     configureTracers configReflection trConfig [txOutboundTr]
     txOutboundTrDoc <- documentTracer (txOutboundTr ::
-      Trace IO (BlockFetch.TraceLabelPeer
+      Logging.Trace IO (BlockFetch.TraceLabelPeer
                   remotePeer
                   (TraceTxSubmissionOutbound (GenTxId blk) (GenTx blk))))
 
@@ -328,21 +351,21 @@ docTracersFirstPhase condConfigFileName = do
                 ["TxSubmission", "LocalServer"]
     configureTracers configReflection trConfig [localTxSubmissionServerTr]
     localTxSubmissionServerTrDoc <- documentTracer (localTxSubmissionServerTr ::
-      Trace IO (TraceLocalTxSubmissionServerEvent blk))
+      Logging.Trace IO (TraceLocalTxSubmissionServerEvent blk))
 
     mempoolTr   <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Mempool"]
     configureTracers configReflection trConfig [mempoolTr]
     mempoolTrDoc <- documentTracer (mempoolTr ::
-      Trace IO (TraceEventMempool blk))
+      Logging.Trace IO (TraceEventMempool blk))
 
     forgeTr <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Forge", "Loop"]
     configureTracers configReflection trConfig [forgeTr]
     forgeTrDoc <- documentTracer (forgeTr ::
-      Trace IO (ForgeTracerType blk))
+      Logging.Trace IO (ForgeTracerType blk))
 
 
     forgeTr' <-  mkCardanoTracer
@@ -350,14 +373,51 @@ docTracersFirstPhase condConfigFileName = do
                 ["Forge", "ThreadStats"]
     configureTracers configReflection trConfig [forgeTr']
     forgeThreadStatsTrDoc <- documentTracer (forgeTr' ::
-      Trace IO ForgeThreadStats)
+      Logging.Trace IO ForgeThreadStats)
 
     blockchainTimeTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["BlockchainTime"]
     configureTracers configReflection trConfig [blockchainTimeTr]
     blockchainTimeTrDoc <- documentTracer (blockchainTimeTr ::
-      Trace IO (TraceBlockchainTimeEvent RelativeTime))
+      Logging.Trace IO (TraceBlockchainTimeEvent RelativeTime))
+
+
+    consensusSanityCheckTr <- mkCardanoTracer
+                 trBase trForward mbTrEKG
+                 ["Consensus", "SanityCheck"]
+    configureTracers configReflection trConfig [consensusSanityCheckTr]
+    consensusSanityCheckTrDoc <- documentTracer (consensusSanityCheckTr ::
+      Logging.Trace IO SanityCheckIssue)
+
+    consensusStartupErrorTr <- mkCardanoTracer
+                trBase trForward mbTrEKG
+                ["Consensus", "Startup"]
+    configureTracers configReflection trConfig [consensusStartupErrorTr]
+    consensusStartupErrorTrDoc <- documentTracer (consensusStartupErrorTr ::
+      Logging.Trace IO ConsensusStartupException)
+
+    consensusGddTr <- mkCardanoTracer
+                 trBase trForward mbTrEKG
+                 ["Consensus", "GDD"]
+    configureTracers configReflection trConfig [consensusGddTr]
+    consensusGddTrDoc <- documentTracer (consensusGddTr ::
+      Logging.Trace IO (TraceGDDEvent peer blk))
+
+    consensusGsmTr <- mkCardanoTracer
+                trBase trForward mbTrEKG
+                ["Consensus", "GSM"]
+    configureTracers configReflection trConfig [consensusGsmTr]
+    consensusGsmTrDoc <- documentTracer (consensusGsmTr ::
+      Logging.Trace IO (TraceGsmEvent (Tip blk)))
+
+    consensusCsjTr <- mkCardanoTracer
+                trBase trForward mbTrEKG
+                ["Consensus", "CSJ"]
+    configureTracers configReflection trConfig [consensusCsjTr]
+    consensusCsjTrDoc <- documentTracer (consensusCsjTr ::
+      Logging.Trace IO (Jumping.TraceEvent peer))
+
 
 -- Node to client
 
@@ -366,14 +426,14 @@ docTracersFirstPhase condConfigFileName = do
                 ["Net"]
     configureTracers configReflection trConfig [keepAliveClientTr]
     keepAliveClientTrDoc <- documentTracer (keepAliveClientTr ::
-      Trace IO (TraceKeepAliveClient peer))
+      Logging.Trace IO (TraceKeepAliveClient peer))
 
     chainSyncTr <- mkCardanoTracer
                 trBase trForward mbTrEKG
                  ["ChainSync", "Local"]
     configureTracers configReflection trConfig [chainSyncTr]
     chainSyncTrDoc <- documentTracer (chainSyncTr ::
-      Trace IO
+      Logging.Trace IO
         (BlockFetch.TraceLabelPeer peer (TraceSendRecv
           (ChainSync (Header blk) (Point blk) (Tip blk)))))
 
@@ -383,7 +443,7 @@ docTracersFirstPhase condConfigFileName = do
         ["TxSubmission", "MonitorClient"]
     configureTracers configReflection trConfig [txMonitorTr]
     txMonitorTrDoc <- documentTracer (txMonitorTr ::
-      Trace IO
+      Logging.Trace IO
         (BlockFetch.TraceLabelPeer
            peer
            (TraceSendRecv
@@ -395,7 +455,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["TxSubmission", "Local"]
     configureTracers configReflection trConfig [txSubmissionTr]
     txSubmissionTrDoc <- documentTracer (txSubmissionTr ::
-      Trace IO
+      Logging.Trace IO
          (BlockFetch.TraceLabelPeer
             peer
             (TraceSendRecv
@@ -407,7 +467,7 @@ docTracersFirstPhase condConfigFileName = do
                        ["StateQueryServer"]
     configureTracers configReflection trConfig [stateQueryTr]
     stateQueryTrDoc <- documentTracer (stateQueryTr ::
-      Trace IO
+      Logging.Trace IO
             (BlockFetch.TraceLabelPeer peer
              (TraceSendRecv
                (LocalStateQuery blk (Point blk) (Query blk)))))
@@ -419,7 +479,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["ChainSync", "Remote"]
     configureTracers configReflection trConfig [chainSyncNodeTr]
     chainSyncNodeTrDoc <- documentTracer (chainSyncNodeTr ::
-      Trace IO (BlockFetch.TraceLabelPeer peer (TraceSendRecv
+      Logging.Trace IO (BlockFetch.TraceLabelPeer peer (TraceSendRecv
                (ChainSync (Header blk) (Point blk) (Tip blk)))))
 
     chainSyncSerialisedTr <-  mkCardanoTracer
@@ -427,7 +487,7 @@ docTracersFirstPhase condConfigFileName = do
                  ["ChainSync", "Remote", "Serialised"]
     configureTracers configReflection trConfig [chainSyncSerialisedTr]
     chainSyncSerialisedTrDoc <- documentTracer (chainSyncSerialisedTr ::
-      Trace IO (BlockFetch.TraceLabelPeer peer (TraceSendRecv
+      Logging.Trace IO (BlockFetch.TraceLabelPeer peer (TraceSendRecv
             (ChainSync (Header blk) (Point blk) (Tip blk)))))
 
     blockFetchTr  <-  mkCardanoTracer
@@ -435,7 +495,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["BlockFetch", "Remote"]
     configureTracers configReflection trConfig [blockFetchTr]
     blockFetchTrDoc <- documentTracer (blockFetchTr ::
-      Trace IO
+      Logging.Trace IO
             (BlockFetch.TraceLabelPeer peer
              (TraceSendRecv
                (BlockFetch blk (Point blk)))))
@@ -445,7 +505,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["BlockFetch", "Remote", "Serialised"]
     configureTracers configReflection trConfig [blockFetchSerialisedTr]
     blockFetchSerialisedTrDoc <- documentTracer (blockFetchSerialisedTr ::
-      Trace IO
+      Logging.Trace IO
             (BlockFetch.TraceLabelPeer peer
              (TraceSendRecv
                (BlockFetch (Serialised blk) (Point blk)))))
@@ -455,7 +515,7 @@ docTracersFirstPhase condConfigFileName = do
                 ["TxSubmission", "Remote"]
     configureTracers configReflection trConfig [txSubmission2Tr]
     txSubmission2TrDoc <- documentTracer (txSubmission2Tr ::
-      Trace IO
+      Logging.Trace IO
         (BlockFetch.TraceLabelPeer peer
           (TraceSendRecv
             (TxSubmission2 (GenTxId blk) (GenTx blk)))))
@@ -466,28 +526,28 @@ docTracersFirstPhase condConfigFileName = do
                 ["Net", "Mux", "Remote"]
     configureTracers configReflection trConfig [dtMuxTr]
     dtMuxTrDoc <- documentTracer (dtMuxTr ::
-      Trace IO (WithMuxBearer (ConnectionId RemoteAddress) MuxTrace))
+      Logging.Trace IO (Mux.WithBearer (ConnectionId RemoteAddress) Mux.Trace))
 
     dtLocalMuxTr   <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "Mux", "Local"]
     configureTracers configReflection trConfig [dtLocalMuxTr]
     dtLocalMuxTrDoc <- documentTracer (dtLocalMuxTr ::
-      Trace IO (WithMuxBearer (ConnectionId LocalAddress) MuxTrace))
+      Logging.Trace IO (Mux.WithBearer (ConnectionId LocalAddress) Mux.Trace))
 
     dtHandshakeTr   <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "Handshake", "Remote"]
     configureTracers configReflection trConfig [dtHandshakeTr]
     dtHandshakeTrDoc <- documentTracer (dtHandshakeTr ::
-      Trace IO (NtN.HandshakeTr NtN.RemoteAddress NtN.NodeToNodeVersion))
+      Logging.Trace IO (NtN.HandshakeTr NtN.RemoteAddress NtN.NodeToNodeVersion))
 
     dtLocalHandshakeTr  <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                  ["Net", "Handshake", "Local"]
     configureTracers configReflection trConfig [dtLocalHandshakeTr]
     dtLocalHandshakeTrDoc <- documentTracer (dtLocalHandshakeTr ::
-      Trace IO
+      Logging.Trace IO
         (NtC.HandshakeTr LocalAddress NtC.NodeToClientVersion))
 
     dtDiffusionInitializationTr   <-  mkCardanoTracer
@@ -495,14 +555,14 @@ docTracersFirstPhase condConfigFileName = do
                 ["Startup", "DiffusionInit"]
     configureTracers configReflection trConfig [dtDiffusionInitializationTr]
     dtDiffusionInitializationTrDoc <- documentTracer (dtDiffusionInitializationTr ::
-      Trace IO (Diffusion.DiffusionTracer Socket.SockAddr LocalAddress))
+      Logging.Trace IO (Diffusion.DiffusionTracer Socket.SockAddr LocalAddress))
 
     dtLedgerPeersTr  <- mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "Peers", "Ledger"]
     configureTracers configReflection trConfig [dtLedgerPeersTr]
     dtLedgerPeersTrDoc <- documentTracer (dtLedgerPeersTr ::
-      Trace IO TraceLedgerPeers)
+      Logging.Trace IO TraceLedgerPeers)
 
 -- DiffusionTracersExtra P2P
     localRootPeersTr  <-  mkCardanoTracer
@@ -510,57 +570,63 @@ docTracersFirstPhase condConfigFileName = do
       ["Net", "Peers", "LocalRoot"]
     configureTracers configReflection trConfig [localRootPeersTr]
     localRootPeersTrDoc <- documentTracer (localRootPeersTr ::
-      Trace IO (TraceLocalRootPeers RemoteAddress SomeException))
+      Logging.Trace IO (TraceLocalRootPeers RemoteAddress SomeException))
 
     publicRootPeersTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "Peers", "PublicRoot"]
     configureTracers configReflection trConfig [publicRootPeersTr]
     publicRootPeersTrDoc <- documentTracer (publicRootPeersTr ::
-      Trace IO TracePublicRootPeers)
+      Logging.Trace IO TracePublicRootPeers)
 
     peerSelectionTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "PeerSelection", "Selection"]
     configureTracers configReflection trConfig [peerSelectionTr]
     peerSelectionTrDoc <- documentTracer (peerSelectionTr ::
-      Trace IO (TracePeerSelection Socket.SockAddr))
+      Logging.Trace IO (TracePeerSelection Socket.SockAddr))
 
     debugPeerSelectionTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "PeerSelection", "Initiator"]
     configureTracers configReflection trConfig [debugPeerSelectionTr]
     debugPeerSelectionTrDoc <- documentTracer (debugPeerSelectionTr ::
-      Trace IO (DebugPeerSelection Socket.SockAddr))
+      Logging.Trace IO (DebugPeerSelection Socket.SockAddr))
 
     debugPeerSelectionResponderTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "PeerSelection", "Responder"]
     configureTracers configReflection trConfig [debugPeerSelectionResponderTr]
     debugPeerSelectionResponderTrDoc <- documentTracer (debugPeerSelectionResponderTr ::
-      Trace IO (DebugPeerSelection Socket.SockAddr))
+      Logging.Trace IO (DebugPeerSelection Socket.SockAddr))
 
     peerSelectionCountersTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "PeerSelection", "Counters"]
     configureTracers configReflection trConfig [peerSelectionCountersTr]
     peerSelectionCountersTrDoc <- documentTracer (peerSelectionCountersTr ::
-      Trace IO PeerSelectionCounters)
+      Logging.Trace IO PeerSelectionCounters)
+
+    churnCountersTr  <-  mkCardanoTracer
+      trBase trForward mbTrEKG
+      ["Net", "Churn"]
+    configureTracers configReflection trConfig [churnCountersTr]
+    churnCountersTrDoc <- documentTracer (churnCountersTr :: Logging.Trace IO ChurnCounters)
 
     peerSelectionActionsTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "PeerSelection", "Actions"]
     configureTracers configReflection trConfig [peerSelectionActionsTr]
     peerSelectionActionsTrDoc <- documentTracer (peerSelectionActionsTr ::
-      Trace IO (PeerSelectionActionsTrace Socket.SockAddr LocalAddress))
+      Logging.Trace IO (PeerSelectionActionsTrace Socket.SockAddr LocalAddress))
 
     connectionManagerTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "ConnectionManager", "Remote"]
     configureTracers configReflection trConfig [connectionManagerTr]
     connectionManagerTrDoc <- documentTracer (connectionManagerTr ::
-      Trace IO
-        (ConnectionManagerTrace
+      Logging.Trace IO
+        (ConnectionManager.Trace
           Socket.SockAddr
           (ConnectionHandlerTrace UnversionedProtocol UnversionedProtocolData)))
 
@@ -569,36 +635,36 @@ docTracersFirstPhase condConfigFileName = do
       ["Net", "ConnectionManager", "Transition"]
     configureTracers configReflection trConfig [connectionManagerTransitionsTr]
     connectionManagerTransitionsTrDoc <- documentTracer (connectionManagerTransitionsTr ::
-      Trace IO (ConnectionManager.AbstractTransitionTrace Socket.SockAddr))
+      Logging.Trace IO (ConnectionManager.AbstractTransitionTrace Socket.SockAddr))
 
     serverTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "Server", "Remote"]
     configureTracers configReflection trConfig [serverTr]
     serverTrDoc <- documentTracer (serverTr ::
-      Trace IO (ServerTrace Socket.SockAddr))
+      Logging.Trace IO (Server.Trace Socket.SockAddr))
 
     inboundGovernorTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
        ["Net", "InboundGovernor", "Remote"]
     configureTracers configReflection trConfig [inboundGovernorTr]
     inboundGovernorTrDoc <- documentTracer (inboundGovernorTr ::
-      Trace IO (InboundGovernorTrace Socket.SockAddr))
+      Logging.Trace IO (InboundGovernor.Trace Socket.SockAddr))
 
     inboundGovernorTransitionsTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
       ["Net", "InboundGovernor", "Transition"]
     configureTracers configReflection trConfig [inboundGovernorTransitionsTr]
     inboundGovernorTransitionsTrDoc <- documentTracer (inboundGovernorTransitionsTr ::
-       Trace IO (InboundGovernor.RemoteTransitionTrace Socket.SockAddr))
+       Logging.Trace IO (InboundGovernor.RemoteTransitionTrace Socket.SockAddr))
 
     localConnectionManagerTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
        ["Net", "ConnectionManager", "Local"]
     configureTracers configReflection trConfig [localConnectionManagerTr]
     localConnectionManagerTrDoc <- documentTracer (localConnectionManagerTr ::
-      Trace IO
-        (ConnectionManagerTrace
+      Logging.Trace IO
+        (ConnectionManager.Trace
           Socket.SockAddr
           (ConnectionHandlerTrace
             UnversionedProtocol
@@ -609,14 +675,14 @@ docTracersFirstPhase condConfigFileName = do
       ["Net", "Server", "Local"]
     configureTracers configReflection trConfig [localServerTr]
     localServerTrDoc <- documentTracer (localServerTr ::
-      Trace IO (ServerTrace LocalAddress))
+      Logging.Trace IO (Server.Trace LocalAddress))
 
     localInboundGovernorTr  <-  mkCardanoTracer
       trBase trForward mbTrEKG
        ["Net", "InboundGovernor", "Local"]
     configureTracers configReflection trConfig [localInboundGovernorTr]
     localInboundGovernorTrDoc <- documentTracer (localInboundGovernorTr ::
-      Trace IO (InboundGovernorTrace LocalAddress))
+      Logging.Trace IO (InboundGovernor.Trace LocalAddress))
 
 
 -- -- DiffusionTracersExtra nonP2P
@@ -626,49 +692,49 @@ docTracersFirstPhase condConfigFileName = do
                 ["Net", "Subscription", "IP"]
     configureTracers configReflection trConfig [dtIpSubscriptionTr]
     dtIpSubscriptionTrDoc <- documentTracer (dtIpSubscriptionTr ::
-      Trace IO (WithIPList (SubscriptionTrace Socket.SockAddr)))
+      Logging.Trace IO (WithIPList (SubscriptionTrace Socket.SockAddr)))
 
     dtDnsSubscriptionTr  <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "Subscription", "DNS"]
     configureTracers configReflection trConfig [dtDnsSubscriptionTr]
     dtDnsSubscriptionTrDoc <- documentTracer (dtDnsSubscriptionTr ::
-      Trace IO (WithDomainName (SubscriptionTrace Socket.SockAddr)))
+      Logging.Trace IO (WithDomainName (SubscriptionTrace Socket.SockAddr)))
 
     dtDnsResolverTr  <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "DNSResolver"]
     configureTracers configReflection trConfig [dtDnsResolverTr]
     dtDnsResolverTrDoc <- documentTracer (dtDnsResolverTr ::
-      Trace IO (WithDomainName DnsTrace))
+      Logging.Trace IO (WithDomainName DnsTrace))
 
     dtErrorPolicyTr  <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "ErrorPolicy", "Remote"]
     configureTracers configReflection trConfig [dtErrorPolicyTr]
     dtErrorPolicyTrDoc <- documentTracer (dtErrorPolicyTr ::
-      Trace IO (WithAddr Socket.SockAddr ErrorPolicyTrace))
+      Logging.Trace IO (WithAddr Socket.SockAddr ErrorPolicyTrace))
 
     dtLocalErrorPolicyTr <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "ErrorPolicy", "Local"]
     configureTracers configReflection trConfig [dtLocalErrorPolicyTr]
     dtLocalErrorPolicyTrDoc <- documentTracer (dtLocalErrorPolicyTr ::
-      Trace IO (WithAddr LocalAddress ErrorPolicyTrace))
+      Logging.Trace IO (WithAddr LocalAddress ErrorPolicyTrace))
 
     dtAcceptPolicyTr    <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Net", "AcceptPolicy"]
     configureTracers configReflection trConfig [dtAcceptPolicyTr]
     dtAcceptPolicyTrDoc <- documentTracer (dtAcceptPolicyTr ::
-      Trace IO NtN.AcceptConnectionsPolicyTrace)
+      Logging.Trace IO NtN.AcceptConnectionsPolicyTrace)
 
     internalTr <-  mkCardanoTracer
                 trBase trForward mbTrEKG
                 ["Reflection"]
     configureTracers configReflection trConfig [internalTr]
     internalTrDoc <- documentTracer (internalTr ::
-      Trace IO TraceDispatcherMessage)
+      Logging.Trace IO TraceDispatcherMessage)
 
 
     let bl =   nodeInfoDpDoc
@@ -677,6 +743,7 @@ docTracersFirstPhase condConfigFileName = do
             <> resourcesTrDoc
             <> startupTrDoc
             <> shutdownTrDoc
+            <> nodeVersionDoc
             <> peersTrDoc
             <> chainDBTrDoc
             <> replayBlockTrDoc
@@ -696,6 +763,11 @@ docTracersFirstPhase condConfigFileName = do
             <> forgeTrDoc
             <> forgeThreadStatsTrDoc
             <> blockchainTimeTrDoc
+            <> consensusSanityCheckTrDoc
+            <> consensusStartupErrorTrDoc
+            <> consensusGddTrDoc
+            <> consensusGsmTrDoc
+            <> consensusCsjTrDoc
 -- NodeToClient
             <> keepAliveClientTrDoc
             <> chainSyncTrDoc
@@ -722,6 +794,7 @@ docTracersFirstPhase condConfigFileName = do
             <> debugPeerSelectionTrDoc
             <> debugPeerSelectionResponderTrDoc
             <> peerSelectionCountersTrDoc
+            <> churnCountersTrDoc
             <> peerSelectionActionsTrDoc
             <> connectionManagerTrDoc
             <> connectionManagerTransitionsTrDoc
@@ -744,10 +817,16 @@ docTracersFirstPhase condConfigFileName = do
 
 docTracersSecondPhase ::
      FilePath
+  -> Maybe FilePath
   -> TraceConfig
   -> DocTracer
   -> IO ()
-docTracersSecondPhase outputFileName trConfig bl = do
-    res <- docuResultsToText bl trConfig
-    T.writeFile outputFileName res
-    pure ()
+docTracersSecondPhase outputFileName mbMetricsHelpFilename trConfig bl = do
+    docuResultsToText bl trConfig
+      >>= doWrite outputFileName
+    forM_ mbMetricsHelpFilename $ \f ->
+       doWrite f (docuResultsToMetricsHelptext bl)
+  where
+    doWrite outfile text =
+      withFile outfile WriteMode $ \handle ->
+        hSetEncoding handle utf8 >> T.hPutStr handle text

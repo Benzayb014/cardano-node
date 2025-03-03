@@ -4,6 +4,8 @@
 {-# LANGUAGE MonoLocalBinds #-}
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Cardano.Node.Types
   ( -- * Configuration
@@ -12,16 +14,19 @@ module Cardano.Node.Types
   , ConfigYamlFilePath(..)
   , DbFile(..)
   , GenesisFile(..)
+  , PeerSnapshotFile (..)
   , ProtocolFilepaths (..)
   , GenesisHash(..)
   , MaxConcurrencyBulkSync(..)
   , MaxConcurrencyDeadline(..)
     -- * Networking
   , TopologyFile(..)
+  , NodeConsensusMode (..)
   , NodeDiffusionMode (..)
     -- * Consensus protocol configuration
   , NodeByronProtocolConfiguration(..)
   , NodeHardForkProtocolConfiguration(..)
+  , npcTestStartingEra
   , NodeProtocolConfiguration(..)
   , NodeShelleyProtocolConfiguration(..)
   , NodeAlonzoProtocolConfiguration(..)
@@ -35,15 +40,17 @@ import           Cardano.Api
 import           Cardano.Crypto (RequiresNetworkMagic (..))
 import qualified Cardano.Crypto.Hash as Crypto
 import           Cardano.Node.Configuration.Socket (SocketConfig (..))
+import           Ouroboros.Network.ConsensusMode (ConsensusMode (..))
 import           Ouroboros.Network.NodeToNode (DiffusionMode (..))
 
 import           Control.Exception
 import           Data.Aeson
 import           Data.ByteString (ByteString)
-import           Data.Monoid (Last)
+import           Data.Monoid (Last (..))
 import           Data.String (IsString)
 import           Data.Text (Text)
 import qualified Data.Text as Text
+import           Data.Typeable
 import           Data.Word (Word16, Word8)
 
 -- | Errors for the cardano-config module.
@@ -76,6 +83,14 @@ newtype GenesisFile = GenesisFile
   deriving stock (Eq, Ord)
   deriving newtype (IsString, Show)
 
+-- | Path containing a serialized ledger peer snapshot
+-- for use by diffusion layer to facilitate bootstrapping
+-- a node in Genesis consensus mode
+--
+newtype PeerSnapshotFile = PeerSnapshotFile { unPeerSnapshotFile :: FilePath }
+  deriving stock (Eq, Show)
+  deriving newtype (FromJSON, ToJSON)
+
 instance FromJSON GenesisFile where
   parseJSON (String genFp) = pure . GenesisFile $ Text.unpack genFp
   parseJSON invalid = fail $ "Parsing of GenesisFile failed due to type mismatch. "
@@ -92,11 +107,34 @@ newtype MaxConcurrencyDeadline = MaxConcurrencyDeadline
   deriving newtype (FromJSON, Show)
 
 
--- | Newtype wrapper which provides 'FromJSON' instance for 'DiffusionMode'.
+-- | Newtype wrapper which provides 'FromJSON' instance for 'ConsensusMode'.
+--
+newtype NodeConsensusMode
+  = NodeConsensusMode { getConsensusMode :: ConsensusMode }
+  deriving newtype Show
+
+instance FromJSON NodeConsensusMode where
+    parseJSON (String str) =
+      case str of
+        "Genesis"
+          -> pure $ NodeConsensusMode GenesisMode
+        "Praos"
+          -> pure $ NodeConsensusMode PraosMode
+        _ -> fail "Parsing NodeConsensusMode failed: can be either 'Genesis' or 'Praos'"
+    parseJSON _ = fail "Parsing NodeConsensusMode failed"
+
+-- | Newtype wrapper which provides 'ToJSON' and 'FromJSON' instances for
+-- 'DiffusionMode'.
 --
 newtype NodeDiffusionMode
   = NodeDiffusionMode { getDiffusionMode :: DiffusionMode }
-  deriving newtype Show
+  deriving newtype (Eq, Show)
+
+instance ToJSON NodeDiffusionMode where
+    toJSON (NodeDiffusionMode InitiatorOnlyDiffusionMode)
+      = String "InitiatorOnly"
+    toJSON (NodeDiffusionMode InitiatorAndResponderDiffusionMode)
+      = String "InitiatorAndResponder"
 
 instance FromJSON NodeDiffusionMode where
     parseJSON (String str) =
@@ -151,6 +189,9 @@ data NodeAlonzoProtocolConfiguration =
 data NodeConwayProtocolConfiguration =
      NodeConwayProtocolConfiguration {
        npcConwayGenesisFile     :: !GenesisFile
+       -- ^ If no conway genesis file is provided, we want
+       -- to enforce a maximum protocol version of 8 to avoid
+       -- a permanent hard fork.
      , npcConwayGenesisFileHash :: !(Maybe GenesisHash)
      }
   deriving (Eq, Show)
@@ -279,6 +320,58 @@ data NodeHardForkProtocolConfiguration =
      , npcTestConwayHardForkAtVersion       :: Maybe Word
      }
   deriving (Eq, Show)
+
+-- | Find the starting era for the test network, if it was configured.
+--
+-- Starting eras have zero defined as a forking epoch. So here we're taking the last zeroed configuration value.
+-- Returns 'Nothing' if no @HardForkAt@ option is present, or all of them have non-zero value - meaning we are
+-- starting from the very first era: Byron.
+--
+-- In mainnet config, the starting era is not configured, so this function will return 'Nothing'.
+--
+-- Introduced in https://github.com/IntersectMBO/cardano-node/pull/5896 as a part of the fix of reading
+-- Plutus V2 cost model. Can be removed when era-sensitive AlonzoGenesis decoding gets removed.
+npcTestStartingEra :: NodeHardForkProtocolConfiguration -> Maybe AnyShelleyBasedEra
+npcTestStartingEra NodeHardForkProtocolConfiguration
+  { npcTestShelleyHardForkAtEpoch
+  , npcTestShelleyHardForkAtVersion
+  , npcTestAllegraHardForkAtEpoch
+  , npcTestAllegraHardForkAtVersion
+  , npcTestMaryHardForkAtEpoch
+  , npcTestMaryHardForkAtVersion
+  , npcTestAlonzoHardForkAtEpoch
+  , npcTestAlonzoHardForkAtVersion
+  , npcTestBabbageHardForkAtEpoch
+  , npcTestBabbageHardForkAtVersion
+  , npcTestConwayHardForkAtEpoch
+  , npcTestConwayHardForkAtVersion
+  } =
+    getLast . mconcat $
+      [ checkIfInstantFork ShelleyBasedEraShelley (EpochNo 0) npcTestShelleyHardForkAtEpoch
+      , checkIfInstantFork ShelleyBasedEraShelley 0 npcTestShelleyHardForkAtVersion
+      , checkIfInstantFork ShelleyBasedEraAllegra (EpochNo 0) npcTestAllegraHardForkAtEpoch
+      , checkIfInstantFork ShelleyBasedEraAllegra 0 npcTestAllegraHardForkAtVersion
+      , checkIfInstantFork ShelleyBasedEraMary (EpochNo 0) npcTestMaryHardForkAtEpoch
+      , checkIfInstantFork ShelleyBasedEraMary 0 npcTestMaryHardForkAtVersion
+      , checkIfInstantFork ShelleyBasedEraAlonzo (EpochNo 0) npcTestAlonzoHardForkAtEpoch
+      , checkIfInstantFork ShelleyBasedEraAlonzo 0 npcTestAlonzoHardForkAtVersion
+      , checkIfInstantFork ShelleyBasedEraBabbage (EpochNo 0) npcTestBabbageHardForkAtEpoch
+      , checkIfInstantFork ShelleyBasedEraBabbage 0 npcTestBabbageHardForkAtVersion
+      , checkIfInstantFork ShelleyBasedEraConway (EpochNo 0) npcTestConwayHardForkAtEpoch
+      , checkIfInstantFork ShelleyBasedEraConway 0 npcTestConwayHardForkAtVersion
+      ]
+  where
+    checkIfInstantFork :: Typeable era
+                       => Eq v
+                       => ShelleyBasedEra era
+                       -> v  -- ^ value indicating instant fork
+                       -> Maybe v -- ^ config param
+                       -> Last AnyShelleyBasedEra -- ^ Just era if instantly forking
+    checkIfInstantFork _ _ Nothing = Last Nothing
+    checkIfInstantFork sbe v (Just tv)
+      | tv == v = Last . Just $ AnyShelleyBasedEra sbe
+      | otherwise = Last Nothing
+
 
 newtype TopologyFile = TopologyFile
   { unTopology :: FilePath }

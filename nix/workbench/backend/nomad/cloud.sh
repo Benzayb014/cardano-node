@@ -11,7 +11,6 @@ backend_nomadcloud() {
 
     name )
       # Can be:
-      # nomadpodman       (Using podman Task Driver in the cloud is not planned)
       # nomadexec  (Starts Nomad Agents supporting the "nix_installable" stanza)
       # nomadcloud    (SRE managed Nomad Agents on Amazon S3 (dedicated or not))
       echo 'nomadcloud'
@@ -24,7 +23,6 @@ backend_nomadcloud() {
       local usage="USAGE: wb backend $op BACKEND-DIR"
       local backend_dir=${1:?$usage}; shift
       # Repeated code / envars set by all sub-backends
-      setenvjqstr 'nomad_task_driver'    "exec"
       setenvjqstr 'nomad_environment'    "cloud"
       setenvjqstr 'one_tracer_per_node'  "true"
       # Cloud runs always run the generator inside Nomad Task "explorer"
@@ -83,13 +81,13 @@ backend_nomadcloud() {
       backend_nomad wait-pools-stopped     60 "$@"
     ;;
 
-    wait-latencies-stopped )
+    wait-workloads-stopped )
       # It passes the sleep time (in seconds) required argument.
       # This time is different between local and cloud backends to avoid
       # unnecesary Nomad specific traffic (~99% happens waiting for node-0, the
       # first one it waits to stop inside a loop) and at the same time be less
       # sensitive to network failures.
-      backend_nomad wait-latencies-stopped 60 "$@"
+      backend_nomad wait-workloads-stopped 60 "$@"
     ;;
 
     fetch-logs )
@@ -148,12 +146,12 @@ backend_nomadcloud() {
       backend_nomad start-generator         "$@"
     ;;
 
-    start-healthchecks )
-      backend_nomad start-healthchecks      "$@"
+    start-workloads )
+      backend_nomad start-workloads         "$@"
     ;;
 
-    start-latencies )
-      backend_nomad start-latencies         "$@"
+    start-healthchecks )
+      backend_nomad start-healthchecks      "$@"
     ;;
 
     start-node )
@@ -254,18 +252,8 @@ setenv-defaults-nomadcloud() {
   #########
   # AWS_* #
   #########
-  # Check all the AWS S3 envars needed for the HTTP PUT request
-  # Using same names as the AWS CLI
-  # https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
-  if test -z "${AWS_ACCESS_KEY_ID:-}" || test -z "${AWS_SECRET_ACCESS_KEY:-}"
-  then
-    msg $(blue "INFO: Amazon S3 \"AWS_ACCESS_KEY_ID\" or \"AWS_SECRET_ACCESS_KEY\" envar is not set")
-    msg $(yellow "WARNING: Fetching \"AWS_ACCESS_KEY_ID\" and \"AWS_SECRET_ACCESS_KEY\" from SRE provided Vault for \"Performance and Tracing\"")
-    local aws_credentials
-    aws_credentials="$(wb_nomad vault world aws-s3-credentials)"
-    export AWS_ACCESS_KEY_ID=$(echo "${aws_credentials}" | jq -r .data.access_key)
-    export AWS_SECRET_ACCESS_KEY=$(echo "${aws_credentials}" | jq -r .data.secret_key)
-  fi
+  local s3_bucket_name="$(jq -r .nomadJob.cloud.s3.bucket "${backend_dir}"/container-specs.json)"
+  msg $(blue "INFO: Using Amazon S3 \"${s3_bucket_name}\" as bucket")
 }
 
 # Sub-backend specific allocs and calls `backend_nomad`'s `allocate-run`.
@@ -860,11 +848,9 @@ deploy-genesis-nomadcloud() {
       --directory="${dir}"/genesis --files-from=-
 
   # Upload genesis tar file
-  local s3_region="eu-central-1"
-  local s3_host="s3.${s3_region}.amazonaws.com";
-  local s3_bucket_name="iog-cardano-perf";
-  local s3_access_key="${AWS_ACCESS_KEY_ID}";
-  local s3_access_key_secret="${AWS_SECRET_ACCESS_KEY}"
+  local s3_bucket_name="$(jq -r .nomadJob.cloud.s3.bucket "${dir}"/container-specs.json)"
+  local s3_region="$(jq -r .nomadJob.cloud.s3.region "${dir}"/container-specs.json)"
+  local s3_uri="$(jq -r .nomadJob.cloud.s3.uri "${dir}"/container-specs.json)"
   local s3_storage_class="STANDARD"
   local return_code=0
   msg "$(blue Uploading) $(yellow "\"${genesis_file_name}\"") to $(yellow "\"s3://${s3_bucket_name}/\"") ..."
@@ -889,16 +875,15 @@ deploy-genesis-nomadcloud() {
   fi
 
   # Generic download from every node.
-  local uri="https://${s3_bucket_name}.${s3_host}/${genesis_file_name}"
-  if ! backend_nomad deploy-genesis-wget "${dir}" "${uri}"
+  if ! backend_nomad deploy-genesis-wget "${dir}" "${s3_uri}"/"${genesis_file_name}"
   then
     # File kept for debugging!
-    msg "$(red "FATAL: deploy-genesis-wget \"${dir}\" \"${uri}\"")"
+    msg "$(red "FATAL: deploy-genesis-wget \"${dir}\" \"${s3_uri}\"")"
     # Already "fatal" -> ignore errors!
     backend_nomad stop-nomad-job "${dir}" || msg "$(red "Failed to stop Nomad Job")"
-    fatal "Deploy of genesis \"${uri}\" failed"
+    fatal "Deploy of genesis \"${s3_uri}\" failed"
   else
-    msg "$(green "Genesis \"${uri}\" deployed successfully")"
+    msg "$(green "Genesis \"${s3_uri}\" deployed successfully")"
     # Don't keep the file once ready, it's not free!
     msg "$(blue Removing) genesis file from $(yellow "\"s3://${s3_bucket_name}\"") ..."
     aws s3 rm                                         \
@@ -1013,18 +998,6 @@ fetch-logs-ssh-node() {
   local ssh_config_path ssh_command
   ssh_config_path="$(wb nomad ssh config)"
   ssh_command="ssh -F ${ssh_config_path} -p 32000 -l nobody"
-  # Download latency(ies) logs. ################################################
-  ##############################################################################
-  msg "$(blue "Fetching") $(yellow "program \"latency\"") run files from $(yellow "\"${node}\" (\"${public_ipv4}\")") ..."
-  if ! rsync -e "${ssh_command}" -au                      \
-         -f'- start.sh'                                   \
-         "${public_ipv4}":/local/run/current/latency/     \
-         "${dir}"/latency/"${node}"/
-  then
-    node_ok="false"
-    touch "${dir}"/nomad/"${node}"/download_failed
-    msg "$(red Error fetching) $(yellow "program \"latency\"") $(red "run files from") $(yellow "\"${node}\" (\"${public_ipv4}\")") ..."
-  fi
   # Download healthcheck(s) logs. ##############################################
   ##############################################################################
   msg "$(blue "Fetching") $(yellow "program \"healthcheck\"") run files from $(yellow "\"${node}\" (\"${public_ipv4}\")") ..."
@@ -1037,6 +1010,22 @@ fetch-logs-ssh-node() {
     touch "${dir}"/nomad/"${node}"/download_failed
     msg "$(red Error fetching) $(yellow "program \"healthcheck\"") $(red "run files from") $(yellow "\"${node}\" (\"${public_ipv4}\")") ..."
   fi
+  # Download workload(s) logs. #################################################
+  ##############################################################################
+  # For every workload
+  for workload in $(jq_tolist '.workloads | map(.name)' "$dir"/profile.json)
+  do
+    msg "$(blue "Fetching") $(yellow "program \"${workload}\" workload") run files from $(yellow "\"${node}\" (\"${public_ipv4}\")") ..."
+    if ! rsync -e "${ssh_command}" -au                                      \
+           -f'- start.sh'                                                   \
+           "${public_ipv4}":/local/run/current/workloads/"${workload}"/     \
+           "${dir}"/workloads/"${workload}"/"${node}"/
+    then
+      node_ok="false"
+      touch "${dir}"/nomad/"${node}"/download_failed
+      msg "$(red Error fetching) $(yellow "program \"${workload}\" workload") $(red "run files from") $(yellow "\"${node}\" (\"${public_ipv4}\")") ..."
+    fi
+  done
   # Download generator logs. ###################################################
   ##############################################################################
   if test "${node}" = "explorer"
